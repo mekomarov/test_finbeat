@@ -1,0 +1,2460 @@
+USE [IStore]
+GO
+/****** Object:  StoredProcedure [dbo].[update_adjusting_forecast]    Script Date: 26.05.2025 10:42:28 ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+-- =============================================
+-- Author:		Комаров Максим Евгеньевич
+-- Task:        
+-- Create date: 29.09.2024
+-- Description:	Расчет корректировок прогноз  
+-- =============================================
+
+ALTER proc [dbo].[update_adjusting_forecast]
+as
+begin
+
+declare @Emails varchar (255) ='mekomarov@omega.sbrf.ru',
+		@copy_recipietns varchar(255)= 'IPKramer@omega.sbrf.ru;Sablina.I.E@omega.sbrf.ru;mekomarov@sberbank.ru;';
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Procedure start', SUSER_NAME() );
+
+
+-------------------------------------------------
+declare @date_transfer date = dateadd(day,1,eomonth(getdate(),-1));
+
+declare @mln int = 1000000; --передаем значения в миллионах 
+declare @period_start date = cast(dateadd(yy,datediff(yy,0,getdate()),0) as date);
+
+declare @period_end date = cast(DATEADD(yy,datediff(yy,0,getdate()) + 1, -1) as date);
+declare @calmonth_start int = replace(left(@period_start,7),'-','');--Фильтр по периоду атрибутов calmonth
+declare @calmonth_end int = replace(left(@period_end,7),'-','');
+declare @own_expenses varchar(10) = 'SELF_TB'; --Собственные расходы ТБ
+declare @transfer_expenses int = (select nid from [OPEX4NMC].[inmc].[v_dic_CorrType] where nid in (46)); --Перенос расходов CIB на аппарат ТБ; 
+declare @cku_transfer_segment int = (select nid from [OPEX4NMC].[inmc].[v_dic_CorrType] where nid in (57)); --ЦКУ: Перенос сегмента ОПК (клиенты машиностроения) на АТБ и между ГОСБ
+--#todo refact: Брать актуальные версии Бизнес плана и прогноза без явного указания
+declare @bp_id varchar(100) = (select top 1 version_id from dict.dbo.v_local_version  where version_name in ('Бизнес-план К2') and begin_dt >= @period_start and end_dt <= @period_end);
+declare @pr_id varchar(100) = (select top 1 version_id from dict.dbo.v_local_version  where version_name in ('Прогноз оперативный') and begin_dt >= @period_start and end_dt <= @period_end);
+declare @flag_opex int = 1;
+declare @sum_corr_zero int = 0; --Не передаем данные где сумма корректировки ровна нулю 
+declare @num_gosb_atb varchar(4) = '0000'; --Для всех АТБ присваиваем номер ГОСБ 0000
+declare @nOrgProfitCenterMK int = (select top 1 t1.nOrgProfitCenterMK from Dict.dbo.grdm_dicOrgPftCntr t1 where t1.sOrgProfitCenterShortName = 'КИБ');
+declare @sql nvarchar(max);
+
+--Для отправки нужны только данные по квартальным месяцам
+drop table if exists #quartrly_month;
+create table #quartrly_month(
+quartrly_month date
+);
+declare 
+@fiscal_year int = year(getdate()),
+@quarter int = 1,
+@cnt int = 4
+
+while @quarter<=@cnt
+begin 
+insert into #quartrly_month
+select cast(dateadd(mm, DATEDIFF(mm, 0, eomonth(DATEFROMPARTS(@fiscal_year,@quarter*3,1))),0) as date);
+set @quarter +=1
+end;
+
+--Задавать параметром version_code
+drop table if exists #v_local_version;
+select gv_id, version_id, version_name,begin_dt
+into #v_local_version
+from dict.dbo.v_local_version 
+where version_id in (@bp_id,@pr_id) 
+and begin_dt >= @period_start
+and end_dt <= @period_end;
+
+--Проверять статус и выбирать актцуальные, подумать 
+--select*from dict.dbo.v_local_version where version_id=3
+--select top 10*from  ramjet.dbo.opexjet_inter_datamart_vers
+--рассчет корректировки для прогноза
+
+--Проверяем возможность обновления 
+
+
+
+--Собственные расходы ТБ
+drop table if exists #v_dim_activity;
+select distinct zpcmact_id
+into #v_dim_activity
+from dict.dbo.zpcmact as vda
+where vda.ZPCMACTL2 = @own_expenses;
+
+--ЦО ур1 и Цо ур2 текст
+drop table if exists #v_dim_rcs;
+select vdr.ZPCMRCS_ID,
+	   right(vdr.zpcmrcsl1,2) as zpcmrcsl1,
+	   vdr.ZPCMRCSL1_TXT,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL2
+into #v_dim_rcs
+from dict.dbo.v_dim_rcs as vdr;
+
+drop table if exists #zpcmcst;
+select z.zpcmcsti1,
+	   z.zpcmcst_id,
+	   z.ZPCMCST
+into #zpcmcst 
+from dict.dbo.zpcmcst as z
+where 1=1 
+and zpcmcst in ('CST_176.3'
+			   ,'CST_184.10'
+			   ,'CST_187.10'
+			   ,'CST_192.35'
+			   ,'CST_184.11'
+			   ,'CST_184.13');
+
+drop table if exists #v_dim_prd;
+select distinct vdp.zpcmprd_id,
+				vdp.prd_name_lv1,
+				vdp.prd_name_lv2
+into #v_dim_prd
+from [DICT].[dbo].[v_dim_prd_for_navigator] as vdp
+where 1=1
+and vdp.prd_name_lv2 not like '%КИБ%';
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Подготовлены данные справочников', SUSER_NAME() );
+
+--4466--2024-01-01
+--4515 --Бизнес-план К2 до ГОСБ	2024-01-01
+drop table if exists #v_opex_bb;
+select vob.zpcmcst_id,
+	   vob.ZPCMRCS_ID,
+	   vob.ZR2TB_ID,
+	   vob.ZPCMPRD_ID,
+	   vob.zinamount,
+	   vob.version_id,
+	   globalversion_id,
+	   vob.R2DCCSOT_ID,
+	   vlv.begin_dt
+into #v_opex_bb
+from istore.[dbo].[v_opex_bb] as vob
+join #v_local_version as vlv on vlv.gv_id = vob.globalversion_id
+where 1=1 
+and exists (select * from #v_dim_activity as vda where vda.zpcmact_id = vob.zpcmact_id)--Собственные расходы ТБ
+and vob.FLAG_OPEX = @flag_opex
+and (vob.calmonth >= @calmonth_start and vob.calmonth <= @calmonth_end);
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Собраны данные в таблице #v_opex_bb', SUSER_NAME() );
+
+
+-------------------------
+drop table if exists #tb_gosb;
+select  distinct ГОСБ1 as gosb_id,	
+			     ТБ_номер as tb_num,
+			     case when len(ГОСБ)<4 then concat('00',ГОСБ) else ГОСБ end as gosb_num
+into #tb_gosb
+from [AMIS_OPEX_AMIS25S].dbstore.dbo.dict_gosb_tb_cluster
+where 1=1
+and ГОСБ not like'%ур2%'
+
+drop table if exists #atb;
+select @num_gosb_atb as gosb_num, 
+	   atb.[ТБ код] as tb_id,
+	   atb.[МВЗ ур2 Текст] as gosb_name,
+	   atb.[ТБ Текст] as tb_txt
+into #atb
+from [AMIS_OPEX_AMIS25S].dbstore.[spr].[Аппараты ТБ] as atb;
+
+--Итог 6 мес 2024
+drop table if exists #dataprep_opex;
+with dataprep as( 
+select vdc.ZPCMCSTI1,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL1_TXT,
+	   fn.prd_name_lv1,
+	   fn.prd_name_lv2,
+	   vob.ZINAMOUNT,
+	   vob.version_id,
+	   vdr.zpcmrcsl1 as tb,
+	   tbg.gosb_num as gosb,
+	   vob.begin_dt
+from #v_opex_bb as vob
+join #v_dim_rcs as vdr on vdr.ZPCMRCS_ID = vob.ZPCMRCS_ID
+left join #tb_gosb as tbg on tbg.gosb_id = vdr.ZPCMRCSL2
+join #zpcmcst as vdc on vdc.zpcmcst_id = vob.zpcmcst_id
+join #v_dim_prd as fn on fn.ZPCMPRD_ID = vob.ZPCMPRD_ID
+where 1=1
+)select d.ZPCMCSTI1,
+		d.ZPCMRCSL2_TXT,
+		d.ZPCMRCSL1_TXT,
+		d.prd_name_lv1,
+		d.prd_name_lv2,
+		d.ZINAMOUNT,
+		d.version_id,
+		d.tb,
+		isnull(d.gosb,a.[gosb_num]) as gosb,
+		d.begin_dt
+into #dataprep_opex
+from dataprep as d
+left join #atb as a on a.[tb_txt] = d.ZPCMRCSL1_TXT
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Собраны промежуточные данные в #datataprep_opex', SUSER_NAME() );
+
+--Итоговая выгрузка
+drop table if exists #adjustment;
+create table #adjustment(
+tb_num int,
+[gosb_num] varchar(255),
+prd_name_lv1 varchar(255),
+prd_name_lv2 varchar(255),
+[cst_name] varchar(255),
+business_plan float,
+forecast_operational float,
+begin_dt date,
+id_gosb_tb_cst varchar(50)
+);
+
+set @sql  =
+'insert into #adjustment
+select TB,
+	   concat(TB,GOSB) as [Номер ГОСБ],
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   concat(''A'',ZPCMCSTI1),
+	   ['+ @bp_id +'],
+	   ['+ @pr_id +'],
+	   begin_dt,
+	   concat(TB,GOSB,''A'',ZPCMCSTI1) as id_gosb_tb_cst
+from
+(
+select TB,
+	   GOSB,
+	   ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   ZINAMOUNT,
+	   version_id,
+	   begin_dt
+from #dataprep_opex
+where 1=1
+and ZPCMRCSL1_TXT <> ''Центральный аппарат''
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #adjustment_sum;
+select tb_num, 
+	   gosb_num, 
+	   cst_name, 
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   id_gosb_tb_cst,
+	   begin_dt, 
+	   sum(business_plan) as business_plan,
+	   sum(forecast_operational) as forecast_operational
+into #adjustment_sum
+from #adjustment
+group by tb_num, 
+	     gosb_num, 
+	     cst_name, 
+	     prd_name_lv1,
+	     prd_name_lv2,
+	     id_gosb_tb_cst,
+	     begin_dt;
+
+drop table if exists #adjustment_data_add
+select 
+	   ISNULL(s2.tb_num, s1.tb_num) as tb_num
+	  ,ISNULL(s2.gosb_num, s1.gosb_num) as gosb_num
+	  ,ISNULL(s2.cst_name, s1.cst_name) as cst_name
+	  ,ISNULL(s2.prd_name_lv1, s1.prd_name_lv1) as prd_name_lv1
+	  ,ISNULL(s2.prd_name_lv2, s1.prd_name_lv2) as prd_name_lv2
+	  ,ISNULL(s2.business_plan, 0) as business_plan
+	  ,ISNULL(s2.forecast_operational, 0) as forecast_operational
+	  ,ISNULL(s2.id_gosb_tb_cst, s1.id_gosb_tb_cst) as id_gosb_tb_cst
+	  ,ISNULL(s2.begin_dt, s1.begin_dt) as begin_dt
+into #adjustment_data_add
+from (
+select 
+	   tb_num, 
+	   gosb_num, 
+	   cst_name, 
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   id_gosb_tb_cst,
+	   s3.begin_dt 
+from #adjustment_sum
+outer apply (select distinct begin_dt from #adjustment_sum) as s3
+group by tb_num, 
+	     gosb_num, 
+	     cst_name, 
+	     prd_name_lv1,
+	     prd_name_lv2,
+	     id_gosb_tb_cst,
+		 s3.begin_dt) as s1
+left join #adjustment_sum as s2 on s1.id_gosb_tb_cst = s2.id_gosb_tb_cst  
+										and s1.begin_dt = s2.begin_dt
+										and s1.prd_name_lv1 = s2.prd_name_lv1;
+
+drop table if exists #adjustment_template;
+with adjustment_data_add as(
+select da.tb_num,
+	   da.gosb_num,
+	   da.cst_name,
+	   da.prd_name_lv1,
+	   da.prd_name_lv2,
+	   da.id_gosb_tb_cst,
+	   sum(da.business_plan) over (partition by da.tb_num, da.gosb_num,da.cst_name,da.prd_name_lv1, da.prd_name_lv2,da.id_gosb_tb_cst order by da.begin_dt asc range unbounded preceding) as business_plan, --Нарастающим итогом по кажому месяцу 
+	   sum(da.forecast_operational) over (partition by da.tb_num, da.gosb_num,da.cst_name,da.prd_name_lv1, da.prd_name_lv2,da.id_gosb_tb_cst order by da.begin_dt asc range unbounded preceding) as forecast_operational, --Нарастающим итогом по кажому месяцу 
+	  da.begin_dt
+from #adjustment_data_add as da
+) select dad.tb_num,
+	     dad.gosb_num,
+	     dad.cst_name,
+	     dad.prd_name_lv1,
+	     dad.prd_name_lv2,
+	     dad.id_gosb_tb_cst,
+	     dad.business_plan,
+	     dad.forecast_operational,
+		 (dad.forecast_operational - dad.business_plan) as corr,
+		 dad.begin_dt
+into #adjustment_template
+from adjustment_data_add as dad;
+
+
+truncate table [dbo].[correction_forecast_all];
+INSERT INTO [dbo].[correction_forecast_all] ([tb_num]
+										    ,[gosb_num]
+										    ,[business_block]
+										    ,[adjustment_period_month]
+										    ,[code_cst_mis]
+										    ,[amount_adjustment]
+										    ,[type_calc])
+select a.tb_num,
+	   a.gosb_num,
+	   a.prd_name_lv2,
+	   a.begin_dt,
+	   a.cst_name,
+	   sum(a.corr)/@mln,
+	   'Корректировка для прогноза'
+from #adjustment_template as a
+where a.corr<> @sum_corr_zero
+and a.begin_dt >= @date_transfer
+group by a.tb_num,
+	     a.gosb_num,
+	     a.prd_name_lv2,
+	     a.begin_dt,
+	     a.cst_name;
+
+
+if(select count(*)from [dbo].[correction_forecast_all] where type_calc = 'Корректировка для прогноза')>0
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Загружены данные по корректировкам для прогноза без ндс', SUSER_NAME() );
+else 
+throw 54564, 'В таблице [dbo].[correction_forecast_all] необновлены данные по корректировкам для прогноза без ндс',1;
+
+--Статья НДС
+drop table if exists #cst_txt_nds; 
+select ZPCMCST_ID as cst_nds,ZPCMCSTI1 as cst_mis
+into #cst_txt_nds
+from [CUBE_OPEXBB].dbo.[v_dim_cst] as cst
+where 1=1
+and cst.cst_name_lv0 = 'Операционные расходы'
+and cst.cst_name_lv1 = 'Налоги, относимые на расходы'
+and cst.cst_name_lv2 = 'НДС';
+
+---Корректировка с НДС
+drop table if exists #dataprep_opex_nds;
+with dataprep as( 
+select vdc.ZPCMCSTI1,
+	   vdc.ZPCMCST,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL1_TXT,
+	   fn.prd_name_lv1,
+	   fn.prd_name_lv2,
+	   vob.ZINAMOUNT,
+	   vob.version_id,
+	   vdr.zpcmrcsl1 as TB,
+	   tbg.gosb_num as GOSB,
+	   vob.ZPCMCST_ID,
+	   vob.R2DCCSOT_ID as cst_id_sender,
+	   vob.begin_dt
+from #v_opex_bb as vob
+join #v_dim_rcs as vdr on vdr.ZPCMRCS_ID = vob.ZPCMRCS_ID
+left join #tb_gosb as tbg on tbg.gosb_id = vdr.ZPCMRCSL2
+join #zpcmcst as vdc on vdc.zpcmcst_id = vob.R2DCCSOT_ID
+join #v_dim_prd as fn on fn.ZPCMPRD_ID = vob.ZPCMPRD_ID
+where 1=1
+)select d.ZPCMCSTI1,
+		d.zpcmcst,
+		d.ZPCMCST_ID,
+		d.cst_id_sender,
+		d.ZPCMRCSL2_TXT,
+		d.ZPCMRCSL1_TXT,
+		d.prd_name_lv1,
+		d.prd_name_lv2,
+		d.ZINAMOUNT,
+		d.version_id,
+		isnull(d.TB,a.[tb_id]) as TB,
+		isnull(d.GOSB,a.[gosb_num]) as GOSB,
+		begin_dt
+into #dataprep_opex_nds
+from dataprep as d
+left join #atb as a on a.[tb_txt] = d.ZPCMRCSL1_TXT;
+
+drop table if exists #adjustment_nds;
+create table #adjustment_nds(
+cst_mis varchar(255),
+gosb_num varchar(10),
+tb_num int,
+bb_lvl1 varchar(50),
+bb_lvl2 varchar(100),
+business_plan float,
+forecast_operational float,
+id_gosb_tb_cst varchar(30),
+begin_dt date 
+);
+
+set @sql='
+insert into #adjustment_nds
+select 
+	   cst_mis,
+	   gosb,
+	   tb,
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   isnull(['+ @bp_id +'],0),
+	   isnull(['+ @pr_id +'],0),
+	   concat(tb,gosb,''A'',cst_mis),
+	   begin_dt
+from
+(
+select 
+	   tn.cst_mis,
+	   op.gosb,
+	   op.tb,
+	   op.prd_name_lv1,
+	   op.prd_name_lv2,
+	   op.ZINAMOUNT,
+	   op.version_id,
+	   op.begin_dt
+from #dataprep_opex_nds as op
+join #cst_txt_nds as tn on tn.cst_nds = op.ZPCMCST_ID
+where 1=1
+and ZPCMRCSL1_TXT <> ''Центральный аппарат''
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt;';
+
+EXEC sp_executesql @SQL; 
+
+drop table if exists #adjustment_nds_data_add
+select 
+	   ISNULL(s2.tb_num, s1.tb_num) as tb_num
+	  ,ISNULL(s2.gosb_num, s1.gosb_num) as gosb_num
+	  ,ISNULL(s2.cst_mis, s1.cst_mis) as cst_mis
+	  ,ISNULL(s2.bb_lvl1, s1.bb_lvl1) as bb_lvl1
+	  ,ISNULL(s2.bb_lvl2, s1.bb_lvl2) as bb_lvl2
+	  ,ISNULL(s2.business_plan, 0) as business_plan
+	  ,ISNULL(s2.forecast_operational, 0) as forecast_operational
+	  ,ISNULL(s2.id_gosb_tb_cst, s1.id_gosb_tb_cst) as id_gosb_tb_cst
+	  ,ISNULL(s2.begin_dt, s1.begin_dt) as begin_dt
+into #adjustment_nds_data_add
+from (
+select 
+	   tb_num, 
+	   gosb_num, 
+	   cst_mis, 
+	   bb_lvl1,
+	   bb_lvl2,
+	   id_gosb_tb_cst,
+	   s3.begin_dt 
+from #adjustment_nds
+outer apply (select distinct begin_dt from #adjustment_nds) as s3
+group by tb_num, 
+	     gosb_num, 
+	     cst_mis, 
+	     bb_lvl1,
+	     bb_lvl2,
+	     id_gosb_tb_cst,
+		 s3.begin_dt) as s1
+left join #adjustment_nds as s2 on s1.id_gosb_tb_cst = s2.id_gosb_tb_cst  
+										and s1.begin_dt = s2.begin_dt
+										and s1.bb_lvl1 = s2.bb_lvl1;
+
+drop table if exists #nds_all_result;
+with nds_all as (
+select an.tb_num,
+	   an.gosb_num,
+	   an.cst_mis,
+	   an.bb_lvl1,
+	   an.bb_lvl2,
+	   sum(an.business_plan) over (partition by an.tb_num,
+												an.gosb_num,
+												an.cst_mis,
+												an.bb_lvl1,
+												an.bb_lvl2,
+												an.id_gosb_tb_cst
+												order by an.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(an.forecast_operational) over (partition by an.tb_num,
+													   an.gosb_num,
+													   an.cst_mis,
+													   an.bb_lvl1,
+													   an.bb_lvl2,
+													   an.id_gosb_tb_cst
+													   order by an.begin_dt asc range unbounded preceding) as forecast_operational,
+       an.id_gosb_tb_cst,
+	   an.begin_dt
+from #adjustment_nds_data_add as an
+)
+select  concat('A',r.cst_mis) as cst_mis,
+		r.bb_lvl1,
+	    r.bb_lvl2,
+		r.business_plan,
+	    r.forecast_operational,
+		(r.forecast_operational - r.business_plan) as corr,
+		r.tb_num,
+		case when gosb_num = 0 then concat(tb_num,r.gosb_num)  else concat(tb_num,r.gosb_num) end as gosb_num,
+		r.begin_dt
+into #nds_all_result
+from nds_all as r;
+
+INSERT INTO [dbo].[correction_forecast_all] ([tb_num]
+										,[gosb_num]
+										,[business_block]
+										,[adjustment_period_month]
+										,[code_cst_mis]
+										,[amount_adjustment]
+										,[type_calc])
+select tb_num,
+	   gosb_num,
+	   bb_lvl1,
+	   begin_dt,
+	   cst_mis,
+	   sum(corr)/@mln,
+	   'Корректировка для прогноза с НДС'
+from #nds_all_result
+where 1=1
+and corr<>0
+and begin_dt>=@date_transfer
+and tb_num<>3 --Центральный аппарат
+group by tb_num,
+	     gosb_num,
+	     bb_lvl1,
+	     begin_dt,
+	     cst_mis;
+
+if(select count(*)from [dbo].[correction_forecast_all] where type_calc = 'Корректировка для прогноза с НДС')>0
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Загружены корректировки с НДС', SUSER_NAME() );
+else 
+throw 54565, 'В таблице [dbo].[correction_forecast_all] необновлены данные по Корректировкам для прогноза с НДС',2;
+
+--Обслуживание ПОС-УС- Расчет 
+--Сегменты КИБ
+--Бизнес блоки КИБ
+drop table if exists #bb_kib;
+with s as
+    (
+      select t5.nOrgProfitCenterMK as nBizBlockMk_5
+		    ,t5.sOrgProfitCenterName as bb_txt_5
+            ,t4.nOrgProfitCenterMK as nBizBlockMk_4
+			,t4.sOrgProfitCenterName as bb_txt_4
+	        ,t3.nOrgProfitCenterMK as nBizBlockMk_3
+			,t3.sOrgProfitCenterName as bb_txt_3
+	        ,t2.nOrgProfitCenterMK as nBizBlockMk_2
+			,t2.sOrgProfitCenterName as bb_txt_2
+	        ,t1.nOrgProfitCenterMK as nBizBlockMk_1
+			,t1.sOrgProfitCenterName as bb_txt_1
+        from Dict..grdm_dicOrgPftCntr t1
+          left join Dict..grdm_dicOrgPftCntr t2 on t2.nParentMK = t1.nOrgProfitCenterMK
+          left join Dict..grdm_dicOrgPftCntr t3 on t3.nParentMK = t2.nOrgProfitCenterMK
+          left join Dict..grdm_dicOrgPftCntr t4 on t4.nParentMK = t3.nOrgProfitCenterMK
+          left join Dict..grdm_dicOrgPftCntr t5 on t5.nParentMK = t4.nOrgProfitCenterMK
+        where t1.nOrgProfitCenterMK = @nOrgProfitCenterMK
+    ) 
+      select distinct nBizBlockMk_5 as nBizBlockMK, bb_txt_5 as bb_txt into #bb_kib from s where nBizBlockMk_5 is not null
+      union 
+      select distinct nBizBlockMk_4 as nBizBlockMK, bb_txt_4 as bb_txt from s where nBizBlockMk_4 is not null
+      union 
+      select distinct nBizBlockMk_3 as nBizBlockMK, bb_txt_3 as bb_txt from s where nBizBlockMk_3 is not null
+      union 
+      select distinct nBizBlockMk_2 as nBizBlockMK, bb_txt_2 as bb_txt from s where nBizBlockMk_2 is not null
+      union 
+      select distinct nBizBlockMk_1 as nBizBlockMK, bb_txt_1 as bb_txt from s where nBizBlockMk_1 is not null;
+
+drop table if exists #dataprep_pos_us_prep;
+with dataprep_pos_us_prep as (
+select ci.TB,
+	   cast(case when ci.GOSB = 29 then 8647 --Уральский ГОСБ, правильно 8647 подставлять
+			 when ci.GOSB = 17 then 17 --ГОСБ Ярославское отделение №17
+				else ci.GOSB end as varchar(10)) as GOSB, 
+	   dc.MISItem,
+	   ci.nBizBlockMK,
+	   vlv.version_id,
+	   vlv.version_name,
+	   ci.dValue,
+	   ci.Corr_Id,
+	   vlv.gv_id,
+	   vlv.begin_dt
+from [OPEX4NMC].inmc.c_isnmc as ci 
+join #v_local_version as vlv on vlv.gv_id = ci.GLOBALVERSION_ID
+join [OPEX4NMC].dbo.dic_CFI as dc on dc.CFI_Id = ci.CFI_Id
+where 1=1 
+and exists (select *from [OPEX4NMC].dbo.t_list_kib_nBizBlockMK as nb where nb.nBizBlockMK = ci.nBizBlockMK)
+and dc.MISItem in('AR_10_38_36','AR_20_44_81')--Статьи MIS #todo refact объявить в начале процедуры 
+--and exists (select *from #zpcmcst as zp where zp.ZPCMCSTI1 = dc.ForecastItem);
+)select up.TB,
+	    case when up.GOSB = '17' then concat('00',gosb) else GOSB end as GOSB, 
+	    up.MISItem,
+	    up.nBizBlockMK,
+	    up.version_id,
+	    up.version_name,
+	    up.dValue,
+	    up.Corr_Id,
+	    up.gv_id,
+	    up.begin_dt  
+into #dataprep_pos_us_prep
+from dataprep_pos_us_prep as up;
+
+drop table if exists #dataprep_pos_us;
+create table #dataprep_pos_us 
+(
+tb_num varchar(2),
+gosb_num varchar(6),
+cst_mis varchar(50),
+nBizBlockMK int,
+level_02 varchar(100),
+level_03 varchar(100),
+corr_Id int,
+business_plan float,
+forecast_operational float,
+id_kib_gosb varchar(20),
+begin_dt date 
+);
+
+set @sql ='
+insert into #dataprep_pos_us
+select TB,
+	   GOSB,
+	   MISItem,
+	   nBizBlockMK,
+	   ''Центры Финансовой отвественности'' as level_02,
+	   ''B2B'' as level_03,
+	   Corr_Id,
+	   isnull(['+ @bp_id +'],0),
+	   isnull(['+ @pr_id +'],0),
+	   concat(GOSB,MISItem) as id_kib_gosb,
+	   begin_dt
+from(
+select TB,
+	   GOSB,
+	   MISItem,
+	   nBizBlockMK,
+	   version_id,
+	   Corr_Id,
+	   dValue,
+	   begin_dt
+from #dataprep_pos_us_prep as po
+where 1=1
+) as t pivot
+(
+sum(dValue)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt;';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #prd_kib;
+select vdp.prd_name_lv1,
+	   vdp.prd_name_lv2,
+	   vdp.ZPCMPRD_ID
+into #prd_kib
+from [DICT].[dbo].[v_dim_prd_for_navigator] as vdp 
+where 1=1
+and ZPCMPRD_TXT = 'КИБ'
+and zpcmprd = 'PRD_0201';
+
+drop table if exists #dataprep_opex_pos_us;
+with dataprep as( 
+select vdc.ZPCMCSTI1,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL1_TXT,
+	   fn.prd_name_lv1,
+	   fn.prd_name_lv2,
+	   vob.ZINAMOUNT,
+	   vob.version_id,
+	   vdr.zpcmrcsl1 as TB,
+	   tbg.gosb_num as GOSB,
+	   vob.globalversion_id,
+	   vob.begin_dt
+from #v_opex_bb as vob
+join #v_dim_rcs as vdr on vdr.ZPCMRCS_ID = vob.ZPCMRCS_ID
+left join #tb_gosb as tbg on tbg.gosb_id = vdr.ZPCMRCSL2
+join #zpcmcst as vdc on vdc.zpcmcst_id = vob.zpcmcst_id
+join #prd_kib as fn on fn.ZPCMPRD_ID = vob.ZPCMPRD_ID
+where 1=1
+)select d.ZPCMCSTI1,
+		d.ZPCMRCSL2_TXT,
+		d.ZPCMRCSL1_TXT,
+		d.prd_name_lv1,
+		d.prd_name_lv2,
+		d.ZINAMOUNT,
+		d.version_id,
+		isnull(d.TB,a.tb_id) as TB,
+		isnull(d.GOSB,a.gosb_num) as GOSB,
+		d.globalversion_id,
+		d.begin_dt
+into #dataprep_opex_pos_us
+from dataprep as d
+left join #atb as a on a.[tb_txt] = d.ZPCMRCSL1_TXT;
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Подготовлены данные для расчета КИБ', SUSER_NAME() );
+
+--ГОСБ (КИБ)
+drop table if exists #data_pos_us_gosb_prep;
+create table #data_pos_us_gosb_prep (
+ZPCMCSTI1 varchar(255),
+ZPCMRCSL2_TXT varchar(255),
+ZPCMRCSL1_TXT varchar(255),
+bb_lvl1 varchar(255),
+bb_lvl2 varchar(255),
+business_plan float,
+forecast_operational float,
+id_kib_gosb varchar(100),
+id_kib_tb varchar(100),
+GOSB int,
+TB int,
+begin_dt date
+);
+
+set @sql='
+insert into #data_pos_us_gosb_prep
+select ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   isnull(['+ @bp_id +'],0) as ''Бизнес-план'',
+	   isnull(['+ @pr_id +'],0) as ''Прогноз оперативный'',
+	   concat(GOSB,''A'',ZPCMCSTI1) as id_kib_gosb,
+	   concat(TB,''A'',ZPCMCSTI1) as id_kib_tb,
+	   GOSB,
+	   TB,
+	   begin_dt
+from
+(
+select ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1 ,
+	   prd_name_lv2 ,
+	   ZINAMOUNT,
+	   version_id,
+	   GOSB,
+	   TB,
+	   begin_dt
+from #dataprep_opex_pos_us
+where 1=1 
+and tb<>99
+and gosb<>0
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #data_pos_us_gosb_prep_v1
+select ISNULL(s2.ZPCMCSTI1, s1.ZPCMCSTI1) as ZPCMCSTI1
+	  ,ISNULL(s2.zpcMRCSL2_TXT, s1.zpcMRCSL2_TXT) as ZPCMRCSL2_TXT
+	  ,ISNULL(s2.ZPCMRCSL1_TXT, s1.ZPCMRCSL1_TXT) as ZPCMRCSL1_TXT
+	  ,ISNULL(s2.bb_lvl1, s1.bb_lvl1) as bb_lvl1
+	  ,ISNULL(s2.bb_lvl2, s1.bb_lvl2) as bb_lvl2
+	  ,ISNULL(s2.business_plan, 0) as business_plan
+	  ,ISNULL(s2.forecast_operational, 0) as forecast_operational
+	  ,ISNULL(s2.id_kib_gosb, s1.id_kib_gosb) as id_kib_gosb
+	  ,ISNULL(s2.id_kib_tb, s1.id_kib_tb) as id_kib_tb
+	  ,ISNULL(s2.GOSB, s1.GOSB) as GOSB
+	  ,ISNULL(s2.TB, s1.TB) as TB
+	  ,ISNULL(s2.begin_dt, s1.begin_dt) as begin_dt
+into #data_pos_us_gosb_prep_v1
+from (
+select ZPCMCSTI1, 
+	   ZPCMRCSL2_TXT, 
+	   ZPCMRCSL1_TXT,
+	   bb_lvl1,
+	   bb_lvl2,
+	   id_kib_gosb,
+	   id_kib_tb, 
+	   GOSB, 
+	   TB, 
+	   s3.begin_dt 
+from #data_pos_us_gosb_prep
+outer apply (select distinct begin_dt from #data_pos_us_gosb_prep) as s3
+group by ZPCMCSTI1, 
+	     ZPCMRCSL2_TXT, 
+		 ZPCMRCSL1_TXT,
+		 bb_lvl1,
+		 bb_lvl2,
+		 id_kib_gosb,
+	     id_kib_tb, 
+	     GOSB,
+		 TB,  
+		 s3.begin_dt) as s1
+left join #data_pos_us_gosb_prep as s2 on s1.id_kib_gosb = s2.id_kib_gosb  
+										and s1.begin_dt = s2.begin_dt;
+
+drop table if exists #data_pos_us_gosb;
+with pos_us as( 
+select  ZPCMCSTI1 
+	   ,ZPCMRCSL2_TXT 
+	   ,ZPCMRCSL1_TXT 
+	   ,bb_lvl1 
+	   ,bb_lvl2
+	   ,sum(business_plan) over (partition by gp.ZPCMCSTI1, gp.ZPCMRCSL2_TXT, gp.ZPCMRCSL1_TXT, gp.bb_lvl1, gp.bb_lvl2, gp.id_kib_gosb, gp.id_kib_tb, gp.GOSB, gp.TB order by gp.begin_dt asc range unbounded preceding) as business_plan
+	   ,sum(forecast_operational) over (partition by gp.ZPCMCSTI1, gp.ZPCMRCSL2_TXT, gp.ZPCMRCSL1_TXT, gp.bb_lvl1, gp.bb_lvl2, gp.id_kib_gosb, gp.id_kib_tb, gp.GOSB, gp.TB order by gp.begin_dt asc range unbounded preceding) as forecast_operational
+	   ,id_kib_gosb 
+	   ,id_kib_tb 
+	   ,GOSB 
+	   ,TB 
+	   ,begin_dt 
+from #data_pos_us_gosb_prep_v1 as gp
+)select ZPCMCSTI1 
+	   ,ZPCMRCSL2_TXT 
+	   ,ZPCMRCSL1_TXT 
+	   ,bb_lvl1 
+	   ,bb_lvl2
+	   ,business_plan
+	   ,forecast_operational
+	   ,(business_plan+forecast_operational) as all_result
+	   ,id_kib_gosb 
+	   ,id_kib_tb 
+	   ,GOSB 
+	   ,TB 
+	   ,begin_dt 
+into #data_pos_us_gosb
+from pos_us
+where 1=1 
+
+drop table if exists #gosb_kib_corr_prep;
+select pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   sum(pu.business_plan) as business_plan ,
+	   sum(pu.forecast_operational) as forecast_operational,
+	   pu.id_kib_gosb,
+	   pu.begin_dt
+into #gosb_kib_corr_prep
+from #dataprep_pos_us as pu
+where 1=1
+and gosb_num not in (0,-1)
+and Corr_Id in(@transfer_expenses,@cku_transfer_segment)
+group by pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   pu.id_kib_gosb,
+	   pu.begin_dt;
+
+--Перенос расходов CIB на аппарат ТБ;
+drop table if exists #gosb_kib_corr;
+with kib_corr as(
+select tb_num,
+	   gosb_num,
+	   [cst_mis],
+	   level_02,
+	   level_03,
+	   sum(business_plan) over (partition by p.tb_num, p.gosb_num, p.level_02, p.level_03, p.id_kib_gosb,p.cst_mis order by p.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(forecast_operational) over (partition by p.tb_num, p.gosb_num, p.level_02, p.level_03, p.id_kib_gosb, p.cst_mis order by p.begin_dt asc range unbounded preceding) as forecast_operational,
+	   id_kib_gosb,
+	   begin_dt
+from #gosb_kib_corr_prep as p 
+)
+select tb_num,
+	   gosb_num,
+	   [cst_mis],
+	   level_02,
+	   level_03,
+	   business_plan,
+	   forecast_operational,
+	   (business_plan + forecast_operational) as all_result,
+	   id_kib_gosb,
+	   begin_dt
+into #gosb_kib_corr
+from kib_corr
+where cst_mis<>'AR_20_25_40';
+
+--Все корректирвоки кроме 46,57 
+drop table if exists #gosb_kib_except_corr_prep;
+select pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   sum(pu.business_plan) as business_plan,
+	   sum(pu.forecast_operational) as forecast_operational,
+	   pu.id_kib_gosb,
+	   pu.begin_dt
+into #gosb_kib_except_corr_prep
+from #dataprep_pos_us as pu
+where pu.gosb_num not in(0,-1) --Не берем АТБ в расчет и ЦА
+and (corr_Id is null or corr_Id not in(@transfer_expenses,@cku_transfer_segment)) --все корректировки кроме
+group by pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   pu.id_kib_gosb,
+	   pu.begin_dt;
+
+drop table if exists #gosb_kib_except_corr;
+with gosb_kib_except_corr as(
+select cp.tb_num,
+	   cp.gosb_num,
+	   cp.cst_mis,
+	   cp.level_02,
+	   cp.level_03,
+	   sum(cp.business_plan) over (partition by cp.tb_num, cp.gosb_num, cp.level_02, cp.level_03, cp.id_kib_gosb,cp.cst_mis order by cp.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(cp.forecast_operational) over (partition by cp.tb_num, cp.gosb_num, cp.level_02, cp.level_03, cp.id_kib_gosb, cp.cst_mis order by cp.begin_dt asc range unbounded preceding) as forecast_operational,
+	   cp.id_kib_gosb,
+	   cp.begin_dt
+from #gosb_kib_except_corr_prep as cp
+)select ec.tb_num,
+	    ec.gosb_num,
+	    ec.cst_mis,
+	    ec.level_02,
+	    ec.level_03,
+	    ec.business_plan,
+	    ec.forecast_operational,
+		(ec.business_plan+ec.forecast_operational) as all_recult,
+	    ec.id_kib_gosb,
+	    ec.begin_dt
+into #gosb_kib_except_corr
+from gosb_kib_except_corr as ec;
+
+--Корректировки 
+--доля CIB БП
+--доля CIB Факт
+drop table if exists #gosb_kib_cib;
+select ks.tb_num,
+	   ks.gosb_num,
+	   ks.cst_mis,
+	   ks.level_02,
+	   ks.level_03,
+	   ug.business_plan,
+	   ug.forecast_operational,
+	   (ug.business_plan + ug.forecast_operational) as all_result,
+	   case when ug.business_plan = 0 or ks.business_plan = 0 then 0 else -(ug.business_plan/ks.business_plan)*100 end as 'part_cib_bp', 
+	   case when ug.forecast_operational = 0 or ks.forecast_operational = 0 then 0 else -(ug.forecast_operational/ks.forecast_operational)*100 end as 'part_cib_fact',
+	   ks.id_kib_gosb,
+	   ks.begin_dt
+into #gosb_kib_cib
+from #gosb_kib_except_corr as ks
+join #gosb_kib_corr as ug on ug.id_kib_gosb = ks.id_kib_gosb and ug.begin_dt=ks.begin_dt
+where 1=1;
+
+-- ГОСБ (КИБ) 
+-- расчет БП с ЦКУ + кор-ки сфд ТБ 
+-- факт с ЦКУ
+-- Кор-ка
+-- CIB план и CIB факт 
+drop table if exists #gosb_kib_bp_fact_cku;
+with bp_fact_cku as(
+select ug.ZPCMRCSL1_TXT,
+	   ug.ZPCMCSTI1,
+	   ug.ZPCMRCSL2_TXT,
+	   ug.bb_lvl2,
+	   ug.business_plan,
+	   ug.forecast_operational,
+	   ug.all_result,
+	   case when kc.id_kib_gosb = ug.id_kib_gosb then ug.business_plan - ug.business_plan*kc.part_cib_bp/100 else ug.business_plan end as [bp cku],-- БП с ЦКУ
+	   case when kc.id_kib_gosb = ug.id_kib_gosb then ug.forecast_operational-ug.forecast_operational*kc.[part_cib_fact]/100 else ug.forecast_operational end as [fact cku],-- Факт с ЦКУ
+	   ug.id_kib_gosb,
+	   ug.id_kib_tb,
+	   ug.TB,
+	   ug.begin_dt,
+	   ug.GOSB
+from #data_pos_us_gosb as ug
+left join #gosb_kib_cib as kc on kc.id_kib_gosb = ug.id_kib_gosb and kc.begin_dt = ug.begin_dt 
+)select ZPCMRCSL1_TXT,
+	    ZPCMCSTI1,
+	    ZPCMRCSL2_TXT,
+	    bb_lvl2,
+	    business_plan,
+	    forecast_operational,
+	    all_result,
+	    [bp cku], 
+	    [fact cku],
+		(business_plan-[bp cku]) as 'cib_plan',
+		(forecast_operational-[fact cku]) as 'cib_fact',
+		id_kib_gosb,
+		id_kib_tb,
+		TB,
+		begin_dt,
+		gosb
+into #gosb_kib_bp_fact_cku
+from bp_fact_cku;
+
+--ГОСБ (КИБ) Сегменты
+drop table if exists #gosb_kib_segments_prep;
+select pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   sum(pu.business_plan) as business_plan,
+	   sum(pu.forecast_operational) as forecast_operational,
+	   pu.id_kib_gosb,
+	   pu.begin_dt
+into #gosb_kib_segments_prep
+from #dataprep_pos_us as pu
+where gosb_num not in(0,-1)
+group by pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   pu.id_kib_gosb,
+	   pu.begin_dt;
+
+drop table if exists #gosb_kib_segments_prep_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.gosb_num, ksb.gosb_num) as gosb_num
+       ,isnull(gksb.cst_mis,ksb.cst_mis) as cst_mis
+       ,isnull(gksb.level_02,ksb.level_02) as level_02
+       ,isnull(gksb.level_03,ksb.level_03) as level_03 
+       ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_kib_gosb,ksb.id_kib_gosb) as id_kib_gosb
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+into #gosb_kib_segments_prep_data_add
+from (
+select  sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+       ,sb.id_kib_gosb
+       ,ugp.begin_dt
+from #gosb_kib_segments_prep as sb
+outer apply (select distinct begin_dt from #gosb_kib_segments_prep) as ugp
+group by sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+       ,sb.id_kib_gosb
+       ,ugp.begin_dt
+) as ksb
+left join #gosb_kib_segments_prep as gksb on gksb.id_kib_gosb = ksb.id_kib_gosb 
+											and gksb.begin_dt = ksb.begin_dt; 
+
+
+--Рассчет корректировки по сегментам КИб, без исключений корректировок
+drop table if exists #gosb_kib_segments_all_corr;
+with gosb_kib_segments_prep as (
+select  sp.tb_num
+       ,sp.gosb_num 
+       ,sp.cst_mis
+       ,sp.level_02 
+       ,sp.level_03 
+       ,sum(sp.business_plan) over (partition by sp.tb_num, sp.gosb_num, sp.level_02, sp.level_03, sp.id_kib_gosb,sp.cst_mis order by sp.begin_dt asc range unbounded preceding) as business_plan
+	   ,sum(sp.forecast_operational) over (partition by sp.tb_num, sp.gosb_num, sp.level_02, sp.level_03, sp.id_kib_gosb, sp.cst_mis order by sp.begin_dt asc range unbounded preceding) as forecast_operational
+	   ,sp.id_kib_gosb
+       ,sp.begin_dt
+from #gosb_kib_segments_prep_data_add as sp
+) select sp.tb_num
+       ,sp.gosb_num 
+       ,sp.cst_mis
+       ,sp.level_02 
+       ,sp.level_03 
+       ,sp.business_plan
+	   ,sp.forecast_operational
+	   ,(sp.business_plan+sp.forecast_operational) as all_result
+	   ,sp.id_kib_gosb
+       ,sp.begin_dt
+into #gosb_kib_segments_all_corr
+from gosb_kib_segments_prep as sp;
+
+--Рассчет корректировки по детализированным блокам
+drop table if exists #gosb_kib_segments_bb_prep;
+select pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   sum(pu.business_plan) as business_plan ,
+	   sum(pu.forecast_operational) as forecast_operational,
+	   pu.id_kib_gosb,
+	   pu.nBizBlockMK,
+	   pu.begin_dt
+into #gosb_kib_segments_bb_prep
+from #dataprep_pos_us as pu
+where gosb_num not in(0,-1)
+group by pu.tb_num,
+	     pu.gosb_num,
+	     pu.cst_mis,
+	     pu.level_02,
+	     pu.level_03,
+	     pu.id_kib_gosb,
+	     pu.nBizBlockMK,
+	     pu.begin_dt;
+
+--Добавляем данные для корректного расчета нарастающим итогом
+drop table if exists #gosb_kib_segments_bb_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.gosb_num, ksb.gosb_num) as gosb_num
+       ,isnull(gksb.cst_mis,ksb.cst_mis) as cst_mis
+       ,isnull(gksb.level_02,ksb.level_02) as level_02
+       ,isnull(gksb.level_03,ksb.level_03) as level_03 
+       ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_kib_gosb,ksb.id_kib_gosb) as id_kib_gosb
+	   ,isnull(gksb.nBizBlockMK,ksb.nBizBlockMK) as nBizBlockMK
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+into #gosb_kib_segments_bb_data_add
+from (
+select  sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+       ,sb.id_kib_gosb
+	   ,sb.nBizBlockMK
+       ,ugp.begin_dt
+from #gosb_kib_segments_bb_prep as sb
+outer apply (select distinct begin_dt from #gosb_kib_segments_bb_prep) as ugp
+group by sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+       ,sb.id_kib_gosb
+	   ,sb.nBizBlockMK
+       ,ugp.begin_dt
+) as ksb
+left join #gosb_kib_segments_bb_prep as gksb on gksb.id_kib_gosb = ksb.id_kib_gosb 
+											and gksb.begin_dt = ksb.begin_dt 
+											and gksb.nBizBlockMK = ksb.nBizBlockMK;
+
+drop table if exists #gosb_kib_segments_bb; 
+with gosb_kib_segments_bb as(
+select  sp.tb_num
+       ,sp.gosb_num 
+       ,sp.level_02 
+       ,sp.level_03 
+       ,sum(sp.business_plan) over (partition by sp.tb_num, sp.gosb_num, sp.level_02, sp.level_03, sp.id_kib_gosb,sp.cst_mis,sp.nBizBlockMK order by sp.begin_dt asc range unbounded preceding) as business_plan
+	   ,sum(sp.forecast_operational) over (partition by sp.tb_num, sp.gosb_num, sp.level_02, sp.level_03, sp.id_kib_gosb, sp.cst_mis, sp.nBizBlockMK order by sp.begin_dt asc range unbounded preceding) as forecast_operational
+       ,sp.id_kib_gosb
+       ,sp.cst_mis
+	   ,sp.nBizBlockMK
+       ,sp.begin_dt
+from #gosb_kib_segments_bb_data_add as sp
+) select sb.tb_num,
+		 sb.gosb_num,
+		 sb.cst_mis,
+		 sb.level_02,
+		 sb.level_03,
+		 sb.nBizBlockMK,
+		 sb.business_plan,
+		 sb.forecast_operational,
+		 (sb.business_plan + sb.forecast_operational) as all_result,
+		 sb.begin_dt,
+		 sb.id_kib_gosb
+into #gosb_kib_segments_bb
+from gosb_kib_segments_bb as sb
+
+--Корректировка в детализации КИБ
+drop table if exists #gosb_corr_detail_kib;
+with gosb_corr_detail_kib as(
+select sb.tb_num,
+	   sb.gosb_num,
+	   sb.cst_mis,
+	   sb.level_02,
+	   sb.level_03,
+	   bb.bb_txt,
+	   sb.business_plan,
+	   sb.forecast_operational,
+	   sb.all_result,
+	   case when sb.business_plan = 0 or fc.business_plan = 0 then 0 else sb.business_plan/fc.business_plan end as [part_detail_kib_bp],--Доля каждого детализированного блока КИБ бизнес плана
+	   case when sb.forecast_operational = 0 or fc.forecast_operational = 0 then 0 else sb.forecast_operational/fc.forecast_operational end as [part_detail_kib_op],--Доля каждого детализированного блока КИБа оперативного прогноза
+	   sb.id_kib_gosb,
+	   sb.begin_dt
+from #gosb_kib_segments_bb as sb
+join #gosb_kib_segments_all_corr as fc on fc.id_kib_gosb = sb.id_kib_gosb and sb.begin_dt=fc.begin_dt
+join #bb_kib as bb on bb.nBizBlockMK = sb.nBizBlockMK
+)select r.tb_num,
+	    r.gosb_num,
+	    r.cst_mis,
+	    r.level_02,
+	    r.level_03,
+	    r.bb_txt,
+	    r.business_plan,
+	    r.forecast_operational,
+	    r.all_result,
+	    r.[part_detail_kib_bp],
+		r.[part_detail_kib_op],
+		((r.[part_detail_kib_op]*[fact cku])-(r.[part_detail_kib_bp]*fc.[bp cku])) as corr_kib, --кор-ка в детализации КИБ
+		r.begin_dt,
+		r.id_kib_gosb
+into #gosb_corr_detail_kib
+from gosb_corr_detail_kib as r
+join #gosb_kib_bp_fact_cku as fc on fc.id_kib_gosb = r.id_kib_gosb and r.begin_dt = fc.begin_dt;
+
+--Шаблон для загрузки ГОСБ
+drop table if exists #gosb_data;
+select gck.tb_num,
+	   gck.gosb_num,
+	   bms.segment,
+	   gck.cst_mis,
+	   sum(gck.[Corr_kib]) as sum_corr,
+	   gck.begin_dt
+into #gosb_data
+from #gosb_corr_detail_kib as gck
+left join dict.pos.bb_map_segment as bms on bms.bb = gck.bb_txt
+group by gck.tb_num,
+		 gck.gosb_num,
+		 bms.segment,
+		 gck.cst_mis,
+		 gck.begin_dt;
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Подготовлены данные для загрузки ГОСБ(КИБ)', SUSER_NAME() );
+
+--Итоговая загрузка
+--Шаблон ГОСБ
+INSERT INTO [dbo].[correction_forecast_all] ([tb_num]
+										,[gosb_num]
+										,[business_block]
+										,[adjustment_period_month]
+										,[code_cst_mis]
+										,[amount_adjustment]
+										,[type_calc])
+select gd.tb_num,
+	   concat(gd.tb_num,gd.gosb_num) as [Номер ГОСБ],
+	   gd.segment,
+	   gd.begin_dt,
+	   gd.cst_mis,
+	   gd.sum_corr/@mln,
+	   'Обслуживание ПОС-УС данные по ГОСБ'
+from #gosb_data as gd
+where gd.sum_corr is not null and gd.sum_corr<>@sum_corr_zero
+and gd.begin_dt >= @date_transfer
+
+if(select count(*)from [dbo].[correction_forecast_all] where type_calc = 'Обслуживание ПОС-УС данные по ГОСБ')>0
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Загружены данные по обслуживанию ПОС-УС по ГОСБ', SUSER_NAME() );
+else 
+throw 54566, 'В таблице [dbo].[correction_forecast_all] необновлены данные по Обслуживание ПОС-УС данные по ГОСБ',3;
+
+---АТБ
+drop table if exists #data_pos_us_ap_prep;
+create table #data_pos_us_ap_prep(
+ZPCMCSTI1 varchar(50),
+ZPCMRCSL2_TXT varchar(255),
+ZPCMRCSL1_TXT varchar(255),
+prd_name_lv1 varchar(100),
+prd_name_lv2 varchar(100),
+business_plan float,
+forecast_operational float,
+id_kib_tb varchar(100),
+tb_num int,
+begin_dt date
+);
+
+--Аппараты
+set @sql='
+insert into #data_pos_us_ap_prep
+select ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1 as ББур1,
+	   prd_name_lv2 as ББур2,
+	   ['+ @bp_id +'],
+	   ['+ @pr_id +'],
+	   concat(TB,''A'',ZPCMCSTI1) as id_kib_tb,
+	   TB,
+	   begin_dt
+from
+(
+select ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1 ,
+	   prd_name_lv2 ,
+	   ZINAMOUNT,
+	   version_id,
+	   TB,
+	   begin_dt
+from #dataprep_opex_pos_us
+where 1=1
+and GOSB = ''0000''
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt;';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #data_pos_us_ap_prep_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.ZPCMCSTI1,ksb.ZPCMCSTI1) as ZPCMCSTI1
+       ,isnull(gksb.prd_name_lv1,ksb.prd_name_lv1) as prd_name_lv1
+       ,isnull(gksb.prd_name_lv2,ksb.prd_name_lv2) as prd_name_lv2 
+	   ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_kib_tb,ksb.id_kib_tb) as id_kib_tb
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+	   ,isnull(gksb.ZPCMRCSL2_TXT,ksb.ZPCMRCSL2_TXT) as ZPCMRCSL2_TXT
+	   ,isnull(gksb.ZPCMRCSL1_TXT, ksb.ZPCMRCSL1_TXT) as ZPCMRCSL1_TXT
+into #data_pos_us_ap_prep_data_add
+from (
+select  sb.tb_num
+       ,sb.ZPCMCSTI1
+       ,sb.prd_name_lv1 
+       ,sb.prd_name_lv2 
+	   ,sb.id_kib_tb
+	   ,sb.ZPCMRCSL2_TXT
+	   ,sb.ZPCMRCSL1_TXT
+       ,ugp.begin_dt
+from #data_pos_us_ap_prep as sb
+outer apply (select distinct begin_dt from #data_pos_us_ap_prep) as ugp
+group by sb.tb_num
+       ,sb.ZPCMCSTI1
+       ,sb.prd_name_lv1 
+       ,sb.prd_name_lv2 
+	   ,sb.id_kib_tb
+	   ,sb.ZPCMRCSL2_TXT
+	   ,sb.ZPCMRCSL1_TXT
+       ,ugp.begin_dt
+) as ksb
+left join #data_pos_us_ap_prep as gksb on gksb.id_kib_tb = ksb.id_kib_tb 
+											and gksb.begin_dt = ksb.begin_dt
+											and gksb.ZPCMRCSL2_TXT = ksb.ZPCMRCSL2_TXT
+
+drop table if exists #data_pos_us_ap; 
+with pos_us_ap as (
+select ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   sum(ap.business_plan) over (partition by ap.ZPCMCSTI1, ap.ZPCMRCSL2_TXT, ap.ZPCMRCSL1_TXT, ap.prd_name_lv1, ap.prd_name_lv2, ap.id_kib_tb, ap.tb_num order by ap.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(ap.forecast_operational) over (partition by ap.ZPCMCSTI1, ap.ZPCMRCSL2_TXT, ap.ZPCMRCSL1_TXT, ap.prd_name_lv1, ap.prd_name_lv2, ap.id_kib_tb, ap.tb_num order by ap.begin_dt asc range unbounded preceding) as forecast_operational,
+	   id_kib_tb,
+	   tb_num,
+	   begin_dt
+from #data_pos_us_ap_prep_data_add as ap
+)
+select ZPCMCSTI1,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   isnull(business_plan,0) as business_plan,
+	   isnull(forecast_operational,0) as forecast_operational,
+	   (isnull(business_plan,0) + isnull(forecast_operational,0)) as all_result,
+	   id_kib_tb,
+	   tb_num,
+	   begin_dt
+into #data_pos_us_ap
+from pos_us_ap;
+
+--АТБ (КИБ) Корректировка 
+-- расчет БП с ЦКУ + кор-ки сфд ТБ 
+-- факт с ЦКУ
+-- Кор-ка
+-- CIB план и CIB факт 
+drop table if exists #atb_kib_corr;
+with bp_fact_cku as(
+select fc.id_kib_tb,
+	   sum(fc.[CIB_plan]) as [CIB_plan_tb],
+	   sum(fc.[CIB_fact]) as [CIB_fact_tb],
+	   fc.begin_dt
+from #gosb_kib_bp_fact_cku as fc
+group by fc.id_kib_tb,fc.begin_dt
+)
+,corr as(
+select ua.ZPCMRCSL1_TXT,
+	   ua.ZPCMCSTI1,
+	   ua.prd_name_lv2,
+	   ua.business_plan,
+	   ua.forecast_operational,
+	   ua.all_result,
+	   (ua.business_plan+isnull(r.CIB_plan_tb,0)) as 'bp_cku',--БП с ЦКУ+ кор-ки сфд тб
+	   (ua.forecast_operational+(isnull(r.[CIB_fact_tb],0))) as 'fact_cku',--БП с ЦКУ+ кор-ки сфд тб
+	   ua.id_kib_tb,
+	   ua.tb_num,
+	   ua.begin_dt
+from #data_pos_us_ap as ua
+left join bp_fact_cku as r on r.id_kib_tb = ua.id_kib_tb and r.begin_dt = ua.begin_dt
+)select c.ZPCMRCSL1_TXT,
+	    c.ZPCMCSTI1,
+	    c.prd_name_lv2,
+	    c.business_plan,
+	    c.forecast_operational,
+	    c.all_result,
+	    c.bp_cku,
+	    c.fact_cku,
+		(c.fact_cku - c.bp_cku) as [corr],	
+		(c.forecast_operational-business_plan) as [corr_no_cku],
+		c.id_kib_tb,
+		c.tb_num,
+		c.begin_dt
+into #atb_kib_corr
+from corr as c;
+
+--АТБ(КИБ) сегменты
+--Рассчет корректировки по сегментам КИБ
+drop table if exists #atb_kib_segments_prep;
+select pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   sum(pu.business_plan) as business_plan,
+	   sum(pu.forecast_operational) as forecast_operational,
+	   concat(pu.tb_num,pu.cst_mis) as id_kib_tb,
+	   begin_dt
+into #atb_kib_segments_prep
+from #dataprep_pos_us as pu
+where gosb_num = 0
+group by pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   concat(pu.tb_num,pu.cst_mis),
+	   begin_dt;
+
+--Добавляем данные по прошлым периодам для расчета нарастающим итогом
+drop table if exists #atb_kib_segments_prep_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.gosb_num, ksb.gosb_num) as gosb_num
+       ,isnull(gksb.cst_mis,ksb.cst_mis) as cst_mis
+       ,isnull(gksb.level_02,ksb.level_02) as level_02
+       ,isnull(gksb.level_03,ksb.level_03) as level_03 
+	   ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_kib_tb,ksb.id_kib_tb) as id_kib_tb
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+into #atb_kib_segments_prep_data_add
+from (
+select  sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+	   ,sb.id_kib_tb
+       ,ugp.begin_dt
+from #atb_kib_segments_prep as sb
+outer apply (select distinct begin_dt from #atb_kib_segments_prep) as ugp
+group by sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+	   ,sb.id_kib_tb
+       ,ugp.begin_dt
+) as ksb
+left join #atb_kib_segments_prep as gksb on gksb.id_kib_tb = ksb.id_kib_tb 
+											and gksb.begin_dt = ksb.begin_dt;
+
+drop table if exists #atb_kib_segments;
+with atb_kib_segments_prep_data_add as(
+select tb_num ,
+	   gosb_num ,
+	   cst_mis,
+	   level_02 ,
+	   level_03 ,
+	   id_kib_tb,
+	   sum(ap.business_plan) over (partition by ap.tb_num, ap.gosb_num, ap.cst_mis, ap.level_02, ap.level_03, ap.id_kib_tb order by ap.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(ap.forecast_operational) over (partition by ap.tb_num, ap.gosb_num, ap.cst_mis, ap.level_02, ap.level_03, ap.id_kib_tb order by ap.begin_dt asc range unbounded preceding) as forecast_operational,
+	   begin_dt
+from #atb_kib_segments_prep_data_add as ap
+where 1=1
+)select tb_num ,
+	    gosb_num ,
+	    cst_mis,
+	    level_02 ,
+	    level_03 ,
+	    id_kib_tb ,
+	    begin_dt,
+		business_plan,
+	    forecast_operational,
+		(business_plan + forecast_operational) as all_result
+into #atb_kib_segments
+from atb_kib_segments_prep_data_add;
+
+--Расчет корректировки по сегментам КИба
+drop table if exists #atb_kib_segments_bb_prep;
+select pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   sum(pu.business_plan) as business_plan,
+	   sum(pu.forecast_operational) as forecast_operational,
+	   concat(pu.tb_num,pu.cst_mis) as id_kib_tb,
+	   nBizBlockMK,
+	   begin_dt
+into #atb_kib_segments_bb_prep
+from #dataprep_pos_us as pu
+where gosb_num = 0
+group by pu.tb_num,
+	   pu.gosb_num,
+	   pu.cst_mis,
+	   pu.level_02,
+	   pu.level_03,
+	   concat(pu.tb_num,pu.cst_mis),
+	   nBizBlockMK,
+	   begin_dt;
+
+drop table if exists #atb_kib_segments_bb_prep_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.gosb_num, ksb.gosb_num) as gosb_num
+       ,isnull(gksb.cst_mis,ksb.cst_mis) as cst_mis
+       ,isnull(gksb.level_02,ksb.level_02) as level_02
+       ,isnull(gksb.level_03,ksb.level_03) as level_03 
+	   ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_kib_tb,ksb.id_kib_tb) as id_kib_tb
+	   ,isnull(gksb.nBizBlockMK,ksb.nBizBlockMK) as nBizBlockMK
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+into #atb_kib_segments_bb_prep_data_add
+from (
+select  sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+	   ,sb.id_kib_tb
+	   ,sb.nBizBlockMK
+       ,ugp.begin_dt
+from #atb_kib_segments_bb_prep as sb
+outer apply (select distinct begin_dt from #atb_kib_segments_bb_prep) as ugp
+group by sb.tb_num
+       ,sb.gosb_num 
+       ,sb.cst_mis
+       ,sb.level_02 
+       ,sb.level_03 
+	   ,sb.id_kib_tb
+	   ,sb.nBizBlockMK
+       ,ugp.begin_dt
+) as ksb
+left join #atb_kib_segments_bb_prep as gksb on gksb.id_kib_tb = ksb.id_kib_tb 
+											and gksb.begin_dt = ksb.begin_dt
+											and gksb.nBizBlockMK = ksb.nBizBlockMK;
+
+drop table if exists #atb_kib_segments_bb;
+with kib_segments_bb as(
+select ap.tb_num ,
+	   ap.gosb_num,
+	   ap.cst_mis ,
+	   ap.level_02 ,
+	   ap.level_03 ,
+	   ap.id_kib_tb ,
+	   ap.nBizBlockMK ,
+	   sum(ap.business_plan) over (partition by ap.tb_num, ap.gosb_num, ap.cst_mis, ap.level_02, ap.level_03, ap.id_kib_tb,ap.nBizBlockMK order by ap.begin_dt asc range unbounded preceding) as business_plan ,
+	   sum(ap.forecast_operational) over (partition by ap.tb_num, ap.gosb_num, ap.cst_mis, ap.level_02, ap.level_03, ap.id_kib_tb,ap.nBizBlockMK order by ap.begin_dt asc range unbounded preceding) as forecast_operational ,
+	   ap.begin_dt 
+from #atb_kib_segments_bb_prep_data_add as ap
+) select tb_num ,
+	     gosb_num,
+	     cst_mis ,
+	     level_02 ,
+	     level_03 ,
+		 business_plan,
+	     forecast_operational,
+		 (business_plan + forecast_operational) as all_result,
+	     id_kib_tb ,
+	     nBizBlockMK ,
+	     begin_dt 
+into #atb_kib_segments_bb
+from kib_segments_bb;
+
+--Доля каждого детализированного блока
+drop table if exists #atb_detail_block;
+with detail_block as(
+select sb.tb_num,
+	   sb.gosb_num,
+	   sb.cst_mis,
+	   sb.level_02,
+	   sb.level_03,
+	   sb.nBizBlockMK,
+	   bk.bb_txt,
+	   sb.business_plan,
+	   sb.forecast_operational,
+	   case when ks.business_plan = 0 and sb.business_plan = 0 then 0 else (sb.business_plan/ks.business_plan) end as part_detail_block_bp, -- Доля каждого детализированного блока КИБа	   
+	   case when ks.forecast_operational = 0 and sb.forecast_operational = 0 then 0 else (sb.forecast_operational/ks.forecast_operational) end as part_detail_block_op, -- Доля каждого детализированного блока КИБа
+	   sb.id_kib_tb,
+	   sb.begin_dt
+from #atb_kib_segments_bb as sb
+join #atb_kib_segments as ks on ks.id_kib_tb = sb.id_kib_tb and ks.begin_dt=sb.begin_dt
+join #bb_kib as bk on bk.nBizBlockMK = sb.nBizBlockMK
+)select r.tb_num,
+	    r.gosb_num,
+	    r.cst_mis,
+	    r.level_02,
+	    r.level_03,
+	    r.nBizBlockMK,
+	    r.bb_txt,
+		r.business_plan,
+	    r.forecast_operational,
+		r.part_detail_block_bp,
+		r.part_detail_block_op,
+		((r.part_detail_block_op*akc.fact_cku) - (r.part_detail_block_bp*akc.bp_cku)) as corr_detail_kib,
+		r.begin_dt,
+		r.id_kib_tb
+into #atb_detail_block
+from detail_block as r
+join #atb_kib_corr as akc on akc.id_kib_tb = r.id_kib_tb and akc.begin_dt = r.begin_dt;
+
+--Шаблон АТБ 
+drop table if exists #atb_template;
+select adb.tb_num,
+       adb.gosb_num,
+	   adb.cst_mis,
+	   ms.segment,
+	   sum(adb.[corr_detail_kib])as sum_corr,
+	   adb.begin_dt
+into #atb_template
+from #atb_detail_block as adb
+left join dict.pos.bb_map_segment as ms on ms.bb = adb.bb_txt
+where 1=1
+group by adb.tb_num,
+         adb.gosb_num,
+	     adb.cst_mis,
+	     ms.segment,
+	     adb.begin_dt;
+
+--загрузка АТБ
+INSERT INTO [dbo].[correction_forecast_all] ([tb_num]
+										,[gosb_num]
+										,[business_block]
+										,[adjustment_period_month]
+										,[code_cst_mis]
+										,[amount_adjustment]
+										,[type_calc])
+select atb.tb_num,
+	   concat(atb.tb_num,atb.gosb_num,'000') as [Номер ГОСБ],
+	   atb.segment,
+	   atb.begin_dt,
+	   atb.cst_mis,
+	   atb.sum_corr/@mln,
+	   'Обслуживание ПОС-УС данные по АТБ'
+from #atb_template as atb
+where atb.sum_corr is not null and atb.sum_corr <>@sum_corr_zero
+and atb.begin_dt >= @date_transfer;
+
+
+if(select count(*)from [dbo].[correction_forecast_all] where type_calc = 'Обслуживание ПОС-УС данные по АТБ')>0
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Загружены данные по обслуживанию ПОС-УС данные по АТБ', SUSER_NAME());
+else 
+throw 54567, 'В таблице [dbo].[correction_forecast_all] не обновлены данные по Обслуживание ПОС-УС данные по АТБ',4;
+
+
+---Корректировка КИБ с НДС
+drop table if exists #dataprep_opex_nds_kib;
+with dataprep as( 
+select vdc.ZPCMCSTI1,
+	   vdc.ZPCMCST,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL1_TXT,
+	   fn.prd_name_lv1,
+	   fn.prd_name_lv2,
+	   vob.ZINAMOUNT,
+	   vob.version_id,
+	   vdr.zpcmrcsl1 as TB,
+	   tbg.gosb_num as GOSB,
+	   vob.ZPCMCST_ID,
+	   vob.R2DCCSOT_ID as cst_id_sender,
+	   vob.begin_dt
+from #v_opex_bb as vob
+join #v_dim_rcs as vdr on vdr.ZPCMRCS_ID = vob.ZPCMRCS_ID
+left join #tb_gosb as tbg on tbg.gosb_id = vdr.ZPCMRCSL2
+join #zpcmcst as vdc on vdc.zpcmcst_id = vob.R2DCCSOT_ID
+join #prd_kib as fn on fn.ZPCMPRD_ID = vob.ZPCMPRD_ID
+where 1=1
+)select d.ZPCMCSTI1,
+		d.zpcmcst,
+		d.ZPCMCST_ID,
+		d.cst_id_sender,
+		d.ZPCMRCSL2_TXT,
+		d.ZPCMRCSL1_TXT,
+		d.prd_name_lv1,
+		d.prd_name_lv2,
+		d.ZINAMOUNT,
+		d.version_id,
+		isnull(d.TB,a.[tb_id]) as TB,
+		isnull(d.GOSB,a.[gosb_num]) as GOSB,
+		begin_dt
+into #dataprep_opex_nds_kib
+from dataprep as d
+left join #atb as a on a.[tb_txt] = d.ZPCMRCSL1_TXT;
+
+drop table if exists #adjustment_nds_kib_prep;
+create table #adjustment_nds_kib_prep(
+ZPCMCSTI1 varchar(255),
+cst_mis varchar(255),
+gosb_num int,
+tb_num int,
+ZPCMRCSL2_TXT varchar(255),
+ZPCMRCSL1_TXT varchar(255),
+bb_lvl1 varchar(50),
+bb_lvl2 varchar(100),
+business_plan float,
+forecast_operational float,
+id_gosb_kib varchar(50),
+begin_dt date 
+);
+
+set @sql='
+insert into #adjustment_nds_kib_prep
+select ZPCMCSTI1,
+	   cst_mis,
+	   gosb,
+	   tb,
+	   ZPCMRCSL2_TXT,
+	   ZPCMRCSL1_TXT,
+	   prd_name_lv1,
+	   prd_name_lv2,
+	   isnull(['+ @bp_id +'],0),
+	   isnull(['+ @pr_id +'],0),
+	   concat(gosb,''A'',ZPCMCSTI1) as id_gosb_kib,
+	   begin_dt
+from
+(
+select ZPCMCSTI1,
+	   tn.cst_mis,
+	   op.gosb,
+	   op.tb,
+	   op.ZPCMRCSL2_TXT,
+	   op.ZPCMRCSL1_TXT,
+	   op.prd_name_lv1,
+	   op.prd_name_lv2,
+	   op.ZINAMOUNT,
+	   op.version_id,
+	   op.begin_dt
+from #dataprep_opex_nds_kib as op
+join #cst_txt_nds as tn on tn.cst_nds = op.ZPCMCST_ID
+where 1=1
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt;';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #gosb_kib_nds_prep;
+select nk.tb_num,
+	   nk.gosb_num,
+	   nk.ZPCMCSTI1,
+	   nk.cst_mis,
+	   nk.bb_lvl2,
+	   sum(nk.business_plan) as business_plan,
+	   sum(nk.forecast_operational) as forecast_operational,
+	   nk.id_gosb_kib,
+	   nk.begin_dt
+into #gosb_kib_nds_prep
+from #adjustment_nds_kib_prep as nk
+where nk.gosb_num<>0
+group by nk.tb_num,
+	   nk.gosb_num,
+	   nk.ZPCMCSTI1,
+	   nk.cst_mis,
+	   nk.bb_lvl2,
+	   nk.id_gosb_kib,
+	   nk.begin_dt;
+
+drop table if exists #gosb_kib_nds_prep_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.gosb_num, ksb.gosb_num) as gosb_num
+       ,isnull(gksb.ZPCMCSTI1,ksb.ZPCMCSTI1) as ZPCMCSTI1
+       ,isnull(gksb.cst_mis,ksb.cst_mis) as cst_mis
+       ,isnull(gksb.bb_lvl2,ksb.bb_lvl2) as bb_lvl2
+	   ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_gosb_kib,ksb.id_gosb_kib) as id_gosb_kib
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+into #gosb_kib_nds_prep_data_add
+from (
+select  sb.tb_num
+       ,sb.gosb_num 
+	   ,sb.ZPCMCSTI1
+       ,sb.cst_mis
+       ,sb.bb_lvl2 
+	   ,sb.id_gosb_kib
+       ,ugp.begin_dt
+from #gosb_kib_nds_prep as sb
+outer apply (select distinct begin_dt from #gosb_kib_nds_prep) as ugp
+group by sb.tb_num
+       ,sb.gosb_num 
+	   ,sb.ZPCMCSTI1
+       ,sb.cst_mis
+       ,sb.bb_lvl2 
+	   ,sb.id_gosb_kib
+       ,ugp.begin_dt
+) as ksb
+left join #gosb_kib_nds_prep as gksb on gksb.id_gosb_kib = ksb.id_gosb_kib 
+											and gksb.begin_dt = ksb.begin_dt;
+
+drop table if exists #gosb_kib_nds;
+with gosb_kib_nds_prep as(
+select da.tb_num,
+	   da.gosb_num,
+	   da.cst_mis,
+	   da.ZPCMCSTI1,
+	   da.bb_lvl2,
+	   sum(da.business_plan) over (partition by da.tb_num, da.gosb_num, da.cst_mis, da.ZPCMCSTI1, da.bb_lvl2 order by da.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(da.forecast_operational) over (partition by da.tb_num, da.gosb_num, da.cst_mis, da.ZPCMCSTI1, da.bb_lvl2 order by da.begin_dt asc range unbounded preceding) as forecast_operational,
+	   da.id_gosb_kib,
+	   da.begin_dt
+from #gosb_kib_nds_prep_data_add as da
+) 
+select np.tb_num,
+	   np.gosb_num,
+	   np.cst_mis,
+	   np.ZPCMCSTI1,
+	   np.bb_lvl2,
+	   np.business_plan,
+	   np.forecast_operational,
+	   (np.business_plan + np.forecast_operational) as all_result,
+	   np.id_gosb_kib,
+	   np.begin_dt
+into #gosb_kib_nds
+from gosb_kib_nds_prep as np;
+
+--ГОСБ (КИБ) (НДС)
+drop table if exists #gosb_kib_nds_corr;
+with gosb_kib_nds_corr as(
+select kn.tb_num,
+	   kn.gosb_num,
+	   kn.cst_mis,
+	   kn.ZPCMCSTI1,
+	   kn.bb_lvl2,
+	   kn.business_plan,
+	   kn.forecast_operational,
+	   kn.all_result,
+	   case when kc.id_kib_gosb = kn.id_gosb_kib and kn.begin_dt = kc.begin_dt then kn.business_plan - kn.business_plan*kc.[part_cib_bp]/100 else kn.business_plan end as bp_cku_corr_sfd_tb,
+	   case when kc.id_kib_gosb = kn.id_gosb_kib and kn.begin_dt = kc.begin_dt then kn.forecast_operational - kn.forecast_operational*kc.part_cib_fact/100 else kn.forecast_operational end as fact_cku,
+	   kn.begin_dt,
+	   kn.id_gosb_kib
+from #gosb_kib_nds as kn
+left join #gosb_kib_cib as kc on kc.id_kib_gosb = kn.id_gosb_kib and kn.begin_dt = kc.begin_dt
+)select nc.tb_num,
+	    nc.gosb_num,
+	    nc.cst_mis,
+	    nc.ZPCMCSTI1,
+	    nc.bb_lvl2,
+	    nc.business_plan,
+	    nc.forecast_operational,
+	    nc.all_result,
+	    isnull(nc.bp_cku_corr_sfd_tb,0) as bp_cku_corr_sfd_tb,
+	    isnull(nc.fact_cku,0) as fact_cku,
+		(isnull(nc.business_plan,0) - isnull(nc.bp_cku_corr_sfd_tb,0)) as cib_plan,
+		(isnull(nc.forecast_operational,0) - isnull(nc.fact_cku,0)) as cib_fact,
+	    nc.begin_dt,
+		nc.id_gosb_kib,
+		concat(tb_num,'A',ZPCMCSTI1) as id_tb_kib
+into #gosb_kib_nds_corr
+from gosb_kib_nds_corr as nc
+where 1=1;
+
+--ГОСБ КИБ сегменты (НДС)
+drop table if exists #gosb_kib_segment_nds;
+select ck.tb_num,
+	   ck.gosb_num,
+	   kn.cst_mis,
+	   kn.ZPCMCSTI1,
+	   ck.level_02,
+	   ck.level_03,
+	   ck.bb_txt,
+	   ck.business_plan,
+	   ck.forecast_operational,
+	   ck.all_result,
+	   ck.part_detail_kib_bp,
+	   ck.part_detail_kib_op,
+	   ((ck.part_detail_kib_op*kn.fact_cku)-(ck.part_detail_kib_bp*kn.bp_cku_corr_sfd_tb)) as corr_detail_kib,
+	   --(ck.part_detail_kib/100 * kn.corr) as corr_detail_kib,
+	   ck.begin_dt
+into #gosb_kib_segment_nds
+from #gosb_corr_detail_kib as ck
+join #gosb_kib_nds_corr as kn on kn.id_gosb_kib = ck.id_kib_gosb 
+							 and kn.begin_dt = ck.begin_dt
+where kn.gosb_num<>0;
+
+drop table if exists #gosb_kib_segment_nds_template;
+select adb.tb_num,
+       adb.gosb_num,
+	   adb.cst_mis,
+	   ms.segment as ББ,
+	   sum(adb.[corr_detail_kib])as sum_corr,
+	   adb.begin_dt
+into #gosb_kib_segment_nds_template
+from #gosb_kib_segment_nds as adb
+left join dict.pos.bb_map_segment as ms on ms.bb = adb.bb_txt
+where 1=1
+group by adb.tb_num,
+         adb.gosb_num,
+	     adb.cst_mis,
+	     ms.segment,
+	     adb.begin_dt;
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Подготовлены данные для шаблона по ГОСБ(КИБ) НДС', SUSER_NAME() );
+
+INSERT INTO [dbo].[correction_forecast_all] ([tb_num]
+										,[gosb_num]
+										,[business_block]
+										,[adjustment_period_month]
+										,[code_cst_mis]
+										,[amount_adjustment]
+										,[type_calc])
+select sn.tb_num,
+	   concat(sn.tb_num,sn.gosb_num) as [Номер ГОСБ],
+	   sn.ББ,
+	   sn.begin_dt,
+	   concat('A',sn.cst_mis),
+	   sn.sum_corr/@mln,
+	   'ГОСБ КИБ сегменты (НДС)'
+from #gosb_kib_segment_nds_template as sn
+where begin_dt >= @date_transfer
+and sum_corr<>@sum_corr_zero
+
+if(select count(*)from [dbo].[correction_forecast_all] where type_calc = 'ГОСБ КИБ сегменты (НДС)')>0
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Загружены данные по обслуживанию ПОС-УС по ГОСБ КИБ сегменты (НДС)', SUSER_NAME() );
+else 
+throw 54599, 'В таблице [dbo].[correction_forecast_all] необновлены данные по Обслуживание ПОС-УС данные по ГОСБ КИБ сегменты (НДС)',4;
+
+--АТБ (КИБ) (НДС)
+--Отбираем аппараты предварительно
+drop table if exists #atb_kib_nds_prep;
+select nk.tb_num,
+	   nk.gosb_num,
+	   nk.ZPCMRCSL2_TXT,
+	   nk.ZPCMCSTI1,
+	   nk.cst_mis,
+	   nk.bb_lvl2,
+	   sum(nk.business_plan) as business_plan,
+	   sum(nk.forecast_operational) as forecast_operational,
+	   nk.id_gosb_kib,
+	   nk.begin_dt,
+	   concat(tb_num,'A',ZPCMCSTI1) as id_kib_tb
+into #atb_kib_nds_prep
+from #adjustment_nds_kib_prep as nk
+where gosb_num=0
+group by nk.tb_num,
+	   nk.gosb_num,
+	   nk.ZPCMRCSL2_TXT,
+	   nk.ZPCMCSTI1,
+	   nk.cst_mis,
+	   nk.bb_lvl2,
+	   nk.id_gosb_kib,
+	   nk.begin_dt,
+	   concat(tb_num,'A',ZPCMCSTI1);
+
+drop table if exists #atb_kib_nds_prep_data_add;
+select  isnull(gksb.tb_num, ksb.tb_num) as tb_num
+       ,isnull(gksb.gosb_num, ksb.gosb_num) as gosb_num
+       ,isnull(gksb.ZPCMCSTI1,ksb.ZPCMCSTI1) as ZPCMCSTI1
+       ,isnull(gksb.cst_mis,ksb.cst_mis) as cst_mis
+       ,isnull(gksb.bb_lvl2,ksb.bb_lvl2) as bb_lvl2
+	   ,isnull(gksb.business_plan,0) as business_plan
+	   ,isnull(gksb.forecast_operational,0) as forecast_operational
+       ,isnull(gksb.id_kib_tb,ksb.id_kib_tb) as id_tb_kib
+       ,isnull(gksb.begin_dt,ksb.begin_dt) as begin_dt
+	   ,isnull(gksb.ZPCMRCSL2_TXT,ksb.ZPCMRCSL2_TXT) as ZPCMRCSL2_TXT
+into #atb_kib_nds_prep_data_add
+from (
+select  sb.tb_num
+       ,sb.gosb_num 
+	   ,sb.ZPCMCSTI1
+       ,sb.cst_mis
+       ,sb.bb_lvl2 
+	   ,sb.id_kib_tb
+       ,sb.ZPCMRCSL2_TXT
+	   ,ugp.begin_dt
+from #atb_kib_nds_prep as sb
+outer apply (select distinct begin_dt from #atb_kib_nds_prep) as ugp
+group by sb.tb_num
+       ,sb.gosb_num 
+	   ,sb.ZPCMCSTI1
+       ,sb.cst_mis
+       ,sb.bb_lvl2 
+	   ,sb.id_kib_tb
+	   ,sb.ZPCMRCSL2_TXT
+       ,ugp.begin_dt
+) as ksb
+left join #atb_kib_nds_prep as gksb on gksb.id_kib_tb = ksb.id_kib_tb 
+											and gksb.begin_dt = ksb.begin_dt
+											and gksb.ZPCMRCSL2_TXT = ksb.ZPCMRCSL2_TXT
+drop table if exists #atb_kib_nds; 
+with atb_kib_nds_prep as (
+select da.tb_num,
+	   da.gosb_num,
+	   da.cst_mis,
+	   da.ZPCMCSTI1,
+	   da.bb_lvl2,
+	   sum(da.business_plan) over (partition by da.tb_num, da.gosb_num, da.cst_mis, da.ZPCMCSTI1, da.bb_lvl2 order by da.begin_dt asc range unbounded preceding) as business_plan,
+	   sum(da.forecast_operational) over (partition by da.tb_num, da.gosb_num, da.cst_mis, da.ZPCMCSTI1, da.bb_lvl2 order by da.begin_dt asc range unbounded preceding) as forecast_operational,
+	   da.id_tb_kib,
+	   da.begin_dt
+from #atb_kib_nds_prep_data_add as da
+) select akp.tb_num,
+	     akp.gosb_num,
+	     akp.cst_mis,
+	     akp.ZPCMCSTI1,
+	     akp.bb_lvl2,
+	     akp.business_plan ,
+	     akp.forecast_operational,
+		 (akp.business_plan+akp.forecast_operational) as all_result,
+	     akp.id_tb_kib,
+	     akp.begin_dt
+into #atb_kib_nds
+from atb_kib_nds_prep as akp;
+
+--Рассчет АТБ КИБ НДС с корректировками
+drop table if exists #atb_kib_nds_corr;
+with gosb_kib_nds_corr as(
+select id_tb_kib,begin_dt, sum(cib_plan) as cib_plan,sum(cib_fact) as cib_fact
+from #gosb_kib_nds_corr
+group by id_tb_kib,begin_dt
+)
+,atb_kib_nds_corr as(
+select kn.tb_num,	
+	   kn.gosb_num,
+	   kn.cst_mis,
+	   kn.ZPCMCSTI1,
+	   kn.bb_lvl2,
+	   kn.business_plan,
+	   kn.forecast_operational,
+	   kn.all_result,
+	   (kn.business_plan + isnull(nc.cib_plan,0)) as bp_cku_corr_sfd_tb,
+	   (kn.forecast_operational + isnull(nc.cib_fact,0)) as fact_cku,
+	   kn.begin_dt,
+	   kn.id_tb_kib
+from #atb_kib_nds as kn
+left join gosb_kib_nds_corr as nc on nc.id_tb_kib = kn.id_tb_kib and nc.begin_dt = kn.begin_dt
+where 1=1
+)select nc.tb_num,
+		nc.gosb_num,
+		nc.cst_mis,
+		nc.ZPCMCSTI1,
+		nc.bb_lvl2,
+		nc.business_plan,
+		nc.forecast_operational,
+		nc.all_result,
+		nc.bp_cku_corr_sfd_tb,
+		nc.fact_cku,
+		(nc.forecast_operational - nc.business_plan) as corr_no_cku,
+		nc.begin_dt,
+		nc.id_tb_kib
+into #atb_kib_nds_corr
+from atb_kib_nds_corr as nc
+where 1=1;
+
+--АТБ (КИБ) сегменты НДС
+drop table if exists #atb_kib_segment_nds;
+select db.tb_num,
+	   db.gosb_num,
+	   nc.cst_mis,
+	   db.cst_mis as zpcmcsti1,
+	   db.level_02,
+	   db.level_03,
+	   db.business_plan,
+	   db.forecast_operational,
+	   db.part_detail_block_bp,
+	   db.part_detail_block_op,
+	   ((db.part_detail_block_op * nc.fact_cku) - (db.part_detail_block_bp * nc.bp_cku_corr_sfd_tb)) as corr_detail_kib,
+	   db.begin_dt,
+	   db.bb_txt
+into #atb_kib_segment_nds
+from #atb_detail_block as db
+left join #atb_kib_nds_corr as nc on nc.id_tb_kib = db.id_kib_tb 
+								 and nc.begin_dt = db.begin_dt;
+
+drop table if exists #atb_kib_segment_nds_template;
+select adb.tb_num,
+       adb.gosb_num,
+	   adb.cst_mis,
+	   ms.segment,
+	   sum(adb.corr_detail_kib)as sum_corr,
+	   adb.begin_dt
+into #atb_kib_segment_nds_template
+from #atb_kib_segment_nds as adb
+left join dict.pos.bb_map_segment as ms on ms.bb = adb.bb_txt
+where 1=1
+group by adb.tb_num,
+         adb.gosb_num,
+	     adb.cst_mis,
+	     ms.segment,
+	     adb.begin_dt;
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Подготовлены данные для шаблона по АТБ(КИБ) НДС', SUSER_NAME() );
+
+INSERT INTO [dbo].[correction_forecast_all] ([tb_num]
+										,[gosb_num]
+										,[business_block]
+										,[adjustment_period_month]
+										,[code_cst_mis]
+										,[amount_adjustment]
+										,[type_calc])
+select sn.tb_num,
+	   concat(sn.tb_num,a.gosb_num) as [Номер ГОСБ],
+	   sn.segment,
+	   sn.begin_dt,
+	   concat('A',sn.cst_mis),
+	   sn.sum_corr/@mln,
+	   'АТБ (КИБ) сегменты НДС'
+from #atb_kib_segment_nds_template as sn
+left join #atb as a on a.tb_id = sn.tb_num
+where begin_dt>=@date_transfer
+and sum_corr<>@sum_corr_zero;
+
+
+if(select count(*)from [dbo].[correction_forecast_all] where type_calc = 'АТБ (КИБ) сегменты НДС')>0
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Загружены данные по обслуживанию ПОС-УС по ГОСБ КИБ сегменты (НДС)', SUSER_NAME() );
+else 
+throw 54588, 'В таблице [dbo].[correction_forecast_all] необновлены данные по Обслуживание ПОС-УС данные по  АТБ (КИБ) сегменты НДС',5;
+
+
+---Проверка расхождений 
+drop table if exists #test_control; 
+select vdc.ZPCMCSTI1,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL1_TXT,
+	   vob.ZINAMOUNT,
+	   vob.version_id,
+	   vdr.zpcmrcsl1 as TB,
+	   tbg.gosb_num as GOSB,
+	   vob.begin_dt
+into #test_control
+from #v_opex_bb as vob
+join #v_dim_rcs as vdr on vdr.ZPCMRCS_ID = vob.ZPCMRCS_ID
+left join #tb_gosb as tbg on tbg.gosb_id = vdr.ZPCMRCSL2
+join #zpcmcst as vdc on vdc.zpcmcst_id = vob.ZPCMCST_ID;
+
+drop table if exists #control_calc;
+create table #control_calc(
+tb_num int,
+ZPCMRCSL1_TXT varchar(255),
+[gosb_num] varchar(255),
+ZPCMRCSL2_TXT varchar(255),
+[cst_name] varchar(255),
+business_plan float,
+forecast_operational float,
+begin_dt date
+);
+
+set @sql  =
+'insert into #control_calc
+select TB,
+	   ZPCMRCSL1_TXT,
+	   GOSB,
+	   ZPCMRCSL2_TXT,
+	   zpcmcsti1,
+	   ['+ @bp_id +'],
+	   ['+ @pr_id +'],
+	   begin_dt
+from
+(
+select TB,
+	   ZPCMRCSL1_TXT,
+	   GOSB,
+	   ZPCMRCSL2_TXT,
+	   zpcmcsti1,
+	   zinamount,
+	   version_id,
+	   begin_dt
+from #test_control
+where 1=1
+and ZPCMRCSL1_TXT <> ''Центральный аппарат''
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #control_calc_sum;
+select cc.tb_num,
+	   cc.ZPCMRCSL1_TXT,
+	   cc.cst_name,
+	   sum(business_plan) as business_plan,
+	   sum(forecast_operational) as forecast_operational,
+	   cc.begin_dt
+into #control_calc_sum
+from #control_calc as cc
+group by cc.tb_num,
+	     cc.ZPCMRCSL1_TXT,
+	     cc.cst_name,
+	     cc.begin_dt;
+
+drop table if exists #control_calc_data_add
+select 
+	   ISNULL(s2.tb_num, s1.tb_num) as tb_num
+	  ,ISNULL(s2.ZPCMRCSL1_TXT, s1.ZPCMRCSL1_TXT) as tb_name
+	  ,ISNULL(s2.cst_name, s1.cst_name) as cst_name
+	  ,ISNULL(s2.business_plan, 0) as business_plan
+	  ,ISNULL(s2.forecast_operational, 0) as forecast_operational
+	  ,ISNULL(s2.begin_dt, s1.begin_dt) as begin_dt
+into #control_calc_data_add
+from (
+select 
+	   tb_num, 
+	   ZPCMRCSL1_TXT,
+	   cst_name, 
+	   s3.begin_dt 
+from #control_calc_sum
+outer apply (select distinct begin_dt from #control_calc_sum) as s3
+group by tb_num, 
+	     ZPCMRCSL1_TXT,
+	     cst_name, 
+	     s3.begin_dt ) as s1
+left join #control_calc_sum as s2 on s1.tb_num = s2.tb_num 
+										and s1.cst_name = s2.cst_name
+										and s1.begin_dt = s2.begin_dt;
+
+drop table if exists #control_calc_result;
+with adjustment_data_add as(
+select da.tb_num, 
+	   da.tb_name,
+	   da.cst_name, 
+	   sum(da.business_plan) over (partition by da.tb_num, da.tb_name,da.cst_name order by da.begin_dt asc range unbounded preceding) as business_plan, --Нарастающим итогом по кажому месяцу 
+	   sum(da.forecast_operational) over (partition by da.tb_num, da.tb_name,da.cst_name order by da.begin_dt asc range unbounded preceding) as forecast_operational, --Нарастающим итогом по кажому месяцу 
+	   da.begin_dt
+from #control_calc_data_add as da
+) select dad.tb_num, 
+		 dad.tb_name,
+		 concat('A',dad.cst_name) as cst_name,
+	     dad.business_plan,
+	     dad.forecast_operational,
+		 (dad.forecast_operational - dad.business_plan)/1000000 as sum_corr_cube,--@mln,
+		 dad.begin_dt
+into #control_calc_result
+from adjustment_data_add as dad
+where begin_dt >=@date_transfer;
+ 
+drop table if exists #correction_forecast_data;
+select cf.tb_num,
+	   cf.code_cst_mis,
+	   cf.adjustment_period_month,
+	   sum(amount_adjustment) as sum_corr_template
+into #correction_forecast_data
+from istore.[dbo].[correction_forecast_all] as cf
+group by cf.tb_num,
+		 cf.code_cst_mis,
+		 cf.adjustment_period_month;
+
+truncate table istore.dbo.control_correction_forecast;
+insert into istore.dbo.control_correction_forecast
+select ccr.tb_num,
+	   ccr.tb_name,
+	   ccr.cst_name,
+	   ccr.begin_dt,
+	   ccr.business_plan,
+	   ccr.forecast_operational,
+	   ccr.sum_corr_cube,
+	   cfd.sum_corr_template,
+	   (round(ccr.sum_corr_cube,4)-round(cfd.sum_corr_template,4)) as deviation_amount
+from #control_calc_result as ccr
+join #correction_forecast_data as cfd on cfd.tb_num = ccr.tb_num
+									and cfd.code_cst_mis = ccr.cst_name
+									and cfd.adjustment_period_month = ccr.begin_dt;
+
+if (select count(*)from istore.dbo.control_correction_forecast where deviation_amount<>0) >0
+throw 54056, 'Есть расхождения сумм корректировок, нужно проверить istore.dbo.control_correction_forecast',1;
+else
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Проверка расхождений 1 пройдена', SUSER_NAME() );
+--Проверка НДС 
+drop table if exists #test_control_nds
+select vdc.ZPCMCSTI1,
+	   vdc.ZPCMCST,
+	   vdr.ZPCMRCSL2_TXT,
+	   vdr.ZPCMRCSL1_TXT,
+	   vob.ZINAMOUNT,
+	   vob.version_id,
+	   vdr.zpcmrcsl1 as TB,
+	   tbg.gosb_num as GOSB,
+	   vob.ZPCMCST_ID,
+	   vob.R2DCCSOT_ID as cst_id_sender,
+	   vob.begin_dt
+into #test_control_nds
+from #v_opex_bb as vob
+join #v_dim_rcs as vdr on vdr.ZPCMRCS_ID = vob.ZPCMRCS_ID
+left join #tb_gosb as tbg on tbg.gosb_id = vdr.ZPCMRCSL2
+join #zpcmcst as vdc on vdc.zpcmcst_id = vob.R2DCCSOT_ID;
+
+drop table if exists #control_calc_nds;
+create table #control_calc_nds(
+tb_num int,
+ZPCMRCSL1_TXT varchar(255),
+[gosb_num] varchar(255),
+ZPCMRCSL2_TXT varchar(255),
+[cst_name] varchar(255),
+cst_nds varchar(150),
+business_plan float,
+forecast_operational float,
+begin_dt date
+);
+
+set @sql='
+insert into #control_calc_nds
+select TB,
+	   ZPCMRCSL1_TXT,
+	   GOSB,
+	   ZPCMRCSL2_TXT,
+	   zpcmcsti1,
+	   cst_mis,
+	   ['+ @bp_id +'],
+	   ['+ @pr_id +'],
+	   begin_dt
+from
+(
+select TB,
+	   ZPCMRCSL1_TXT,
+	   GOSB,
+	   ZPCMRCSL2_TXT,
+	   zpcmcsti1,
+	   tn.cst_mis,
+	   zinamount,
+	   version_id,
+	   begin_dt
+from #test_control_nds as op
+join #cst_txt_nds as tn on tn.cst_nds = op.ZPCMCST_ID
+where 1=1
+and ZPCMRCSL1_TXT <> ''Центральный аппарат''
+)as s pivot
+(
+sum(ZINAMOUNT)
+for version_id in (['+ @bp_id +'],['+ @pr_id +'])) as pvt;';
+EXEC sp_executesql @SQL; 
+
+drop table if exists #control_calc_sum_nds;
+select cc.tb_num,
+	   cc.ZPCMRCSL1_TXT,
+	   cc.cst_nds,
+	   sum(business_plan) as business_plan,
+	   sum(forecast_operational) as forecast_operational,
+	   cc.begin_dt
+into #control_calc_sum_nds
+from #control_calc_nds as cc
+group by cc.tb_num,
+	     cc.ZPCMRCSL1_TXT,
+	     cc.cst_nds,
+	     cc.begin_dt;
+
+
+drop table if exists #control_calc_data_add_nds
+select 
+	   ISNULL(s2.tb_num, s1.tb_num) as tb_num
+	  ,ISNULL(s2.ZPCMRCSL1_TXT, s1.ZPCMRCSL1_TXT) as tb_name
+	  ,ISNULL(s2.cst_nds, s1.cst_nds) as cst_nds
+	  ,ISNULL(s2.business_plan, 0) as business_plan
+	  ,ISNULL(s2.forecast_operational, 0) as forecast_operational
+	  ,ISNULL(s2.begin_dt, s1.begin_dt) as begin_dt
+into #control_calc_data_add_nds
+from (
+select 
+	   tb_num, 
+	   ZPCMRCSL1_TXT,
+	   cst_nds, 
+	   s3.begin_dt 
+from #control_calc_sum_nds
+outer apply (select distinct begin_dt from #control_calc_sum_nds) as s3
+group by tb_num, 
+	     ZPCMRCSL1_TXT,
+	     cst_nds, 
+	     s3.begin_dt ) as s1
+left join #control_calc_sum_nds as s2 on s1.tb_num = s2.tb_num 
+										and s1.cst_nds = s2.cst_nds
+										and s1.begin_dt = s2.begin_dt;
+
+drop table if exists #control_calc_result_nds;
+with adjustment_data_add_nds as(
+select da.tb_num, 
+	   da.tb_name,
+	   da.cst_nds, 
+	   sum(da.business_plan) over (partition by da.tb_num, da.tb_name,da.cst_nds order by da.begin_dt asc range unbounded preceding) as business_plan, --Нарастающим итогом по кажому месяцу 
+	   sum(da.forecast_operational) over (partition by da.tb_num, da.tb_name,da.cst_nds order by da.begin_dt asc range unbounded preceding) as forecast_operational, --Нарастающим итогом по кажому месяцу 
+	   da.begin_dt
+from #control_calc_data_add_nds as da
+) select dad.tb_num, 
+		 dad.tb_name,
+		 concat('A',dad.cst_nds) as cst_nds,
+	     dad.business_plan,
+	     dad.forecast_operational,
+		 (dad.forecast_operational - dad.business_plan)/@mln as sum_corr_cube,
+		 dad.begin_dt
+into #control_calc_result_nds
+from adjustment_data_add_nds as dad
+where begin_dt >=@date_transfer;
+
+insert into istore.dbo.control_correction_forecast
+select ccr.tb_num,
+	   ccr.tb_name,
+	   ccr.cst_nds,
+	   ccr.begin_dt,
+	   ccr.business_plan,
+	   ccr.forecast_operational,
+	   ccr.sum_corr_cube,
+	   cfd.sum_corr_template,
+	   (round(ccr.sum_corr_cube,5)-round(cfd.sum_corr_template,5)) as deviation_amount
+from #control_calc_result_nds as ccr
+join #correction_forecast_data as cfd on cfd.tb_num = ccr.tb_num
+									and cfd.code_cst_mis = ccr.cst_nds
+									and cfd.adjustment_period_month = ccr.begin_dt
+
+if (select count(*)from istore.dbo.control_correction_forecast where deviation_amount<>0)>0 
+throw 54056, 'Есть расхождения сумм корректировок, проверь istore.dbo.control_correction_forecast Статьи НДС',1;
+else
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'Проверка расхождений 2 пройдена', SUSER_NAME() );
+
+truncate table [dbo].[correction_forecast];
+INSERT INTO [dbo].[correction_forecast] ([tb_num]
+                                        ,[gosb_num]
+                                        ,[business_block]
+                                        ,[adjustment_period_month]
+                                        ,[code_cst_mis]
+                                        ,[amount_adjustment]
+                                        ,[data_upload]
+                                        ,[type_calc])
+SELECT [tb_num]
+      ,[gosb_num]
+      ,[business_block]
+      ,[adjustment_period_month]
+      ,[code_cst_mis]
+      ,[amount_adjustment]
+      ,[data_upload]
+      ,[type_calc]
+FROM [dbo].[correction_forecast_all] as cf
+where exists (select*from #quartrly_month as qm where qm.quartrly_month = cf.adjustment_period_month)
+
+
+--Отправка файла на ФИР в ПИМОП
+insert into AMIS_OPEX_AMIS25S.AVRORA_PRD.dbo.showCaseStatus([name],[dateReport],[created])
+values('correction_forecast_pimop',null,getdate());
+
+--Отправляем сообщение, данные обновили  
+insert into SERVDB.[mail].[MsgLst]([Recipients], [Subjects], [Body],Copy_Recipients) 
+values (@Emails,'Корректировки по прогнозу', 'Добрый день!' + char(13) + 'Расчёт ручных корректировок для ОВБП и передача в ЦК ПИМОП выполнен!' + char(13) + 'Хорошего Вам дня!',
+@copy_recipietns);
+
+Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
+values ( object_name(@@PROCID), getdate(), 'proc end', SUSER_NAME() );
+end
+
