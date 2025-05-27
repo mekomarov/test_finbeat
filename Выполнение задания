@@ -1,0 +1,169 @@
+/*
+Задача 2
+Даны таблицы:
+Clients - клиенты
+(
+        	Id bigint, -- Id клиента
+        	ClientName nvarchar(200) -- Наименование клиента
+);
+ClientContacts - контакты клиентов
+(
+        	Id bigint, -- Id контакта
+        	ClientId bigint, -- Id клиента
+        	ContactType nvarchar(255), -- тип контакта
+        	ContactValue nvarchar(255) --  значение контакта
+);
+1.Написать запрос, который возвращает наименование клиентов и кол-во контактов клиентов
+2.Написать запрос, который возвращает список клиентов, у которых есть более 2 контактов
+*/
+use test_work;
+
+--Подготовка буферных таблиц для загрузки данных
+create table dbo.Clients_buf(
+	[Наименование] nvarchar(50) NOT NULL,
+	[клиентов] nvarchar(50) NOT NULL
+);
+
+create table dbo.type_contacts_buf(
+	[Тип_контакта] nvarchar(50) NOT NULL,
+	[Значение_контакта] [nvarchar](50) NOT NULL
+);
+
+
+--Подготовка структуры данных
+drop table if exists dbo.Clients;
+create table dbo.Clients(
+id bigint identity(1,1) primary key,
+clientName nvarchar(200) not null
+);
+
+drop table if exists dbo.ClientContacs;
+create table dbo.ClientContacs(
+id bigint identity (1,1),
+ClientId bigint foreign key references dbo.Clients(id) on delete cascade not null,
+ContactType nvarchar(255),
+ContactValue nvarchar(255) not null
+);
+
+--Генерация данных для запросов 
+--Использовал gpt чтобы придумать 100 наименований клиентов
+--Вставка данных из excel в буферную таблицу, проверяем на дубли данных, вставка в буферную таблицу с помощью powershell скрипт прикладываю 
+--Проверяем базу имен на дубли, если дублей нет, загружаем в прод таблицу, если дубли есть, получаем ошибку и разбираемся в причинах 
+drop table if exists #clients;
+with uniq_cl as(
+select concat ([Наименование],' ',[клиентов]) as client_name
+from dbo.Clients_buf
+--union all
+--select 'Александр Иванов' --Для тестов, что проверка на ошибки работает нужно раскомментировать вставку записи  
+)
+select client_name, row_number() over(partition by client_name order by client_name) as cnt
+into #clients
+from uniq_cl;
+
+if (select count(*) from #clients as cl where cl.cnt <> 1) >0
+throw 50008, 'В наименовании клиентов есть дубли, нужно разобраться в причинах',1
+else 
+insert into dbo.Clients (clientName)
+select client_name
+from #clients
+
+--Использовал gpt для генерации различных вариаций типов контактов и значений
+--Добавлены данные в промежуточную таблицу test_work.dbo.type_contacts_buf 
+--Сгенерируем ClientId 
+
+--Для цикла нам нехватает порядковых номеров в таблице контактов, сгенерируем
+drop table if exists #type_contact;
+create table #type_contact(
+id int identity(1,1),
+type_contact varchar(255),
+value_contact varchar(255),
+);
+insert into #type_contact (type_contact,value_contact)
+select [Тип_контакта],
+       [Значение_контакта]
+from dbo.type_contacts_buf
+
+
+--Наполним таблицу с контактами, присваивая случайный ClientId
+declare @cnt_clients int = (select count(*) from dbo.Clients) --Количество клиентов подставим переменную для генерация случайного ClientId
+declare @max_num int = (select max(id) from #type_contact) 
+declare @min_num int = (select min(id) from #type_contact)
+
+while @min_num < @max_num
+begin
+insert into dbo.ClientContacs (ClientId,ContactType,ContactValue)
+select ceiling(rand()*(@cnt_clients)) as client_id,
+       type_contact,
+       value_contact
+from #type_contact as tcb
+where tcb.id = @min_num
+set @min_num += 1
+end
+
+select* from dbo.Clients
+select* from dbo.ClientContacs
+
+--1.Написать запрос, который возвращает наименование клиентов и кол-во контактов клиентов
+set statistics time on
+
+select cl.clientName, 
+       count(cc.ContactValue) as num_contacts
+from dbo.Clients as cl
+join dbo.ClientContacs as cc on cc.ClientId = cl.id
+group by clientName 
+
+set statistics time off
+
+
+/*
+ Время работы SQL Server:
+   Время ЦП = 0 мс, затраченное время = 0 мс.
+
+(100 rows affected)
+Таблица "Worktable". Число просмотров 0, логических чтений 0, физических чтений 0, упреждающих чтений 0, lob логических чтений 0, lob физических чтений 0, lob упреждающих чтений 0.
+Таблица "ClientContacs". Число просмотров 1, логических чтений 6, физических чтений 0, упреждающих чтений 0, lob логических чтений 0, lob физических чтений 0, lob упреждающих чтений 0.
+Таблица "Clients". Число просмотров 1, логических чтений 4, физических чтений 0, упреждающих чтений 0, lob логических чтений 0, lob физических чтений 0, lob упреждающих чтений 0.
+
+ Время работы SQL Server:
+   Время ЦП = 0 мс, затраченное время = 1 мс.
+*/
+
+
+
+
+--2.Написать запрос, который возвращает список клиентов, у которых есть более 2 контактов
+with res as(
+select cl.clientName,
+       row_number() over (partition by cc.ContactValue order by cc.ClientId asc) as cnt
+from dbo.Clients as cl
+join dbo.ClientContacs as cc on cc.ClientId = cl.id
+)select clientName,
+        count(cnt) as cnt    
+from res
+group by clientName
+having count(cnt)>2
+
+
+--Задача 3
+--Написать запрос, который возвращает интервалы для одинаковых Id. Например, есть такой набор данных:
+drop table if exists #dates
+create table #dates(
+id bigint,
+dt date
+);
+
+insert into #dates (id,dt)
+values (1,'01.01.2021'),
+       (1,'10.01.2021'),
+       (1,'30.01.2021'),
+       (2,'15.01.2021'),
+       (2,'30.01.2021');
+
+with dates as(
+select dat.id,
+       dat.dt, 
+       lead(dat.dt,1) over (partition by id order by id) as ed
+from #dates as dat
+)select *
+from dates as d
+where d.ed is not null
