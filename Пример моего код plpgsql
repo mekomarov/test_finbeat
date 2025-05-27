@@ -1,0 +1,826 @@
+-- DROP PROCEDURE navigator_edr.group_8490_opex();
+
+CREATE OR REPLACE PROCEDURE navigator_edr.group_8490_opex()
+ LANGUAGE plpgsql
+AS $procedure$ 
+-- =============================================
+-- Author:		Комаров Максим Евгеньевич
+-- Task:        https://jira.delta.sbrf.ru/browse/OPEX-4869 
+-- Create date: 2025-01-16
+-- Description:	
+-- =============================================
+
+-- пока через переменные и в текстах (команде поддержки так удобнее при ручном запуске), в будущем будет читаться из таблицы настроек с возможностью просмотра и редактирования в интерфейсе EPM
+declare 
+var_bp varchar(100) := 'Бизнес-план К3';
+var_fact varchar(100) := 'Факт в методологии 2024';
+var_calmonth_start int := 202301;
+var_methods int := 2024; 
+var_nefin_bis varchar(100) := 'Нефинансовый бизнес B2C';
+var_fin_bis varchar(100) := 'Финансовый бизнес B2C';
+var_r2dcactt1 varchar(255) := '''КИБ'', ''РБ'', ''Сеть продаж'', ''Технологии'', ''Сервисы''';
+var_pao varchar (3) := 'ПАО';
+var_bisiness_type varchar(100) := 'Финансовый бизнес'; 
+var_source_name_opex varchar(100) :='t_ch_opex_bb';
+
+var_cfo varchar(100) := '%ЦФО%'; 
+var_other varchar(100) := '%Прочие%';
+var_sberx varchar(100) := 'SberX';
+var_fb varchar(5)  :=''' ФБ''';
+var_field_cst varchar(100) := 'Статья 1';
+var_comment varchar(100) := 'Структура OPEX';
+var_field_bb varchar(100) := 'Бизнес-блок';
+
+var_old_method int := 2022;
+var_type_calc varchar(50) := 'ПАО не ВГО';
+var_mln float := 1000000.0;
+var_source_name_tuk varchar(50) := 't_ch_tuk';
+var_do varchar(5) := 'ДО';
+var_cst_lvl_1 varchar(100) := 'OPEX';
+var_in_system_calc varchar(100) := 'Внутрисистемные расчеты';
+var_operation_group varchar(100) := 'Операции Группы и ПК';
+var_cst_field_lvl_3 varchar(100) := 'Статья уровень 3';
+var_func_block varchar(100) := 'ДО ФБ';
+var_run_change varchar(50) := 'ДЗО run change';
+var_vers_id int;
+var_sql_act text;
+var_vers_min int;
+var_vers_max int;
+var_lvl_0 varchar(10) := 'Группа';
+var_lvl_max int := 8;
+var_table_name_from text := 'temp_full_opex';
+var_table_name_into text := 'temp_opex_by_layers';
+var_variant int = 2;
+var_s_comment varchar(255) := '''OPEX->ф:CoreBanking/RUN/Группа/ПАО/ДО->Динамика OPEX''';
+var_kpi varchar(10) = '62241';
+var_dynamic_type varchar(10) = '''3''';
+var_nTotalType varchar(10) = '''3''';
+
+var_value_other varchar(100) := 'Прочие';
+var_value_other_bb varchar(100) := 'Прочие Блоки';
+var_value_other_bb_fb varchar(100) := 'Прочие блоки ФБ';
+
+var_value_plan varchar(100) := 'План';
+var_value_fact varchar(100) := 'Факт';
+var_value_do_vgo varchar(100) := 'ДО ВГО';
+var_value_do_not_vgo varchar(100) := 'ДО не ВГО';
+
+var_value_pao_dzo varchar(100) := '''ПАО/ДЗО''';
+var_value_fin_nefin varchar(100) := '''Фин/Нефин''';
+var_value_category varchar(100) := '''Категории''';
+var_value_bb varchar(100) := '''Бизнес-блоки''';
+var_value_fb varchar(100) := '''Функциональные блоки''';
+var_value_run_change varchar(100) := '''RUN/CHANGE''';
+var_value_dzo varchar(100) := '''ДЗО''';
+
+var_one_for_while int := 1;
+
+var_id_min int;
+var_id_max int;
+var_group varchar(100);
+var_pao_do varchar(255);
+var_fin_nefin varchar(255);
+var_category varchar(255);
+var_bissblock varchar(255);
+var_funcblock varchar(255);
+var_run_change_set varchar(255);
+var_dzo varchar(255);
+var_others varchar(255);
+
+var_sql_query_opex_prep text;
+sql_full_opex text;
+sql_get_opex_by_layers text;
+sql_text_opex_by_layers text;
+sql_text_pao_kat text;
+var_id_set int :=1;
+var_cnt_cycle int;-- = var_id_set;
+
+var_axis_18 varchar(255);
+var_axis_19 varchar(255);
+var_axis_20 varchar(255);
+var_criterion_opex varchar(255);
+var_criterion_tuk varchar(255);
+
+start_proc timestamp := now();
+proc_name varchar(100) :=  'navigator_edr.group_8490_opex';
+
+begin
+	
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 1,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'proc start',
+						   userid => 13,
+						   begin_rid => 0);	
+
+drop table if exists mapParams;
+create temp table mapParams as(
+select distinct version_id,version_name
+from s24_di_dbo.v_local_version
+where version_name in (var_bp,var_fact));
+
+--#todo ref -в цикле по каждой версии агрегация будет быстрее, выделяются доп.потоки  
+--Время выполнения: 
+--2.55min version_id 10 (9 worker_planned)
+--2.44min version_id 90 (9 worker_planned)
+drop table if exists opex_bb;
+create temp table opex_bb(
+methods int,
+calmonth int,
+version_id int,
+zpcmprd_id int,
+zpcmacto_id int,
+zpcmcst_id int,
+cumulative_y float
+);
+
+drop table if exists cnt_vers;
+create temp table cnt_vers ( 
+id int generated always as identity,
+version_id int,
+version_name varchar(100));
+
+insert into cnt_vers (version_id,version_name)
+select version_id,
+       version_name
+from mapParams;
+
+--09.12 min
+--do $$
+--declare 
+var_vers_min := (select min(id) from cnt_vers);
+var_vers_max := (select max(id) from cnt_vers);
+--begin 
+
+while var_vers_min <= var_vers_max
+loop
+insert into opex_bb
+select var_methods as methods,--todo, подставлять актуальную для расчета из настроек
+       opex_bb.calmonth,
+       opex_bb.version_id,
+	   opex_bb.zpcmprd_id,
+	   opex_bb.zpcmacto_id,
+	   opex_bb.zpcmcst_id,
+	   sum(opex_bb.cumulative_y) as cumulative_y
+from navigator_edr.t_c_opex_bb_norm as opex_bb
+where opex_bb.version_id = (select version_id from cnt_vers where id = var_vers_min)
+and opex_bb.calmonth >= var_calmonth_start 
+group by opex_bb.calmonth,
+         opex_bb.version_id,
+	     opex_bb.zpcmprd_id,
+	     opex_bb.zpcmacto_id,
+	     opex_bb.zpcmcst_id;
+
+var_vers_min = var_vers_min + var_one_for_while; 
+end loop;
+--end $$;
+ 
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 2,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'Завершена агрегация данных navigator_edr.t_c_opex_bb_norm',
+						   userid => 13,
+						   begin_rid => 0);	
+  
+--Бизнес блоки
+drop table if exists prd;
+create temp table prd as(
+select distinct 
+		zpcmprd_id,     -- Бизнес-блок id
+		zpcmprdl1_txt   -- Бизнес-блок текст  (ур1)
+from s26_na_dict.prd);
+
+--Активности
+drop table if exists act;
+create temp table act as(
+select distinct
+       act."ZPCMACT_ID" as zpcmact_id,
+       act."R2DCACTT1_TXT" as r2dcactt1_txt,--[Функциональный блок для отчетности ур1]
+	   act."ZPCMACTL1" as zpcmactl1,--[Функциональный блок]
+	   act."ZPCMACTL1_TXT" as zpcmactl1_txt,---[Функциональный блок текст]
+	   act."STRUCTRCL1" as structrcl1, -- структура RUN CHANGE ур1
+	   act."ZR2FUNCTX" as zr2functx--[Признак входящих плат]
+from s26_na_dict.act as act);
+
+--Статьи
+drop table if exists cst;
+create temp table cst as (
+select  distinct
+        zpcmcst_id,-- Статья id
+		zpcmcst,   -- Статья код
+		zpcmcstt1, -- Статья ур1 текст
+		zpcmcstt2  --[Статья 2]	
+from s26_na_dict.cst);
+
+--Время выполнения: 02.41 min
+drop table if exists opex_bb_prep;
+create temp table opex_bb_prep as( 
+select opex_bb.methods,
+       opex_bb.calmonth,
+	   opex_bb.version_id,
+	   var_pao as pao_do, 
+	   var_bisiness_type as fin_nefin,
+	   prd.zpcmprdl1_txt as bis_block_lvl1_txt,--[Бизнес-блок текст  (ур1)],
+	   act.r2dcactt1_txt as func_block_for_report_lvl1,--[Функциональный блок для отчетности ур1],
+	   act.zpcmactl1_txt as func_block_txt,--[Функциональный блок текст],
+	   act.structrcl1 as struct_run_change_lvl1,--[структура RUN CHANGE ур1],
+	   act.zr2functx as indication_incoming_payments,--[Признак входящих плат],
+	   cst.zpcmcstt1 as cst_lvl1_txt,--[Статья ур1 текст],
+	   cst.zpcmcstt2 as cst_2,--[Статья 2],
+	   opex_bb.cumulative_y
+from opex_bb as opex_bb
+join cst as cst on cst.zpcmcst_id = opex_bb.zpcmcst_id
+left join act as act on act.zpcmact_id = opex_bb.zpcmacto_id
+left join prd as prd on prd.zpcmprd_id = opex_bb.zpcmprd_id);
+
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 3,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'завершено добавление данных справочников, активности, статьи и блоки',
+						   userid => 13,
+						   begin_rid => 0);	
+
+drop table if exists renames_opex;
+create temp table renames_opex as (
+select t_h_dict.field,
+	   t_h_dict.curname,
+	   t_h_dict."rename" as rename,
+	   t_h_dict."comment" as comment,
+	   t_h_dict."method" as method 
+from s26_na_edr."t_h_dict_Renames" as t_h_dict
+where t_h_dict."sourceName" = var_source_name_opex);
+
+--Формирование данных t_ch_opex_bb
+--Время выполнения:02.36 min 
+var_sql_query_opex_prep :='	
+drop table if exists t_ch_opex_bb_prep;
+create temp table t_ch_opex_bb_prep as(
+select opex_bb.methods,
+       opex_bb.calmonth,
+	   opex_bb.version_id,
+	   opex_bb.pao_do,
+	   case when re_cst.rename is null then '''|| var_value_other ||''' else re_cst.rename end as cst_1,
+	   opex_bb.fin_nefin,
+	   case when opex_bb.bis_block_lvl1_txt in ('''|| var_nefin_bis ||''','''|| var_fin_bis ||''') then opex_bb.bis_block_lvl1_txt 
+	           when re_bb.rename is null or re_bb.rename ilike '''|| var_cfo ||''' or re_bb.rename ilike '''|| var_other ||''' or re_bb.rename = '''|| var_sberx ||''' then '''|| var_value_other_bb ||'''
+			      else re_bb.rename end as bis_block, 
+       case when opex_bb.func_block_for_report_lvl1 in ('|| var_r2dcactt1 ||') then concat(opex_bb.func_block_for_report_lvl1,'|| var_fb ||') else '''|| var_value_other_bb_fb ||''' end as func_block,
+	   opex_bb.struct_run_change_lvl1 as run_change,
+	   opex_bb.indication_incoming_payments,
+	   opex_bb.cst_2,
+	   opex_bb.cumulative_y
+from opex_bb_prep as opex_bb
+left join renames_opex as re_cst on re_cst.curname = opex_bb.cst_lvl1_txt
+                                   and re_cst.field = '''|| var_field_cst ||'''
+		                           and re_cst.comment = '''|| var_comment ||'''
+		                           and (re_cst.method = methods or re_cst.method is null)
+left join renames_opex as re_bb on re_bb.curname = opex_bb.bis_block_lvl1_txt
+                                   and re_bb.field = '''|| var_field_bb ||'''
+		                           and (re_bb.method = '|| var_old_method ||' or re_bb.method is null));';	
+		                          
+--raise notice '%',var_sql_query_opex_prep;		                          
+execute var_sql_query_opex_prep;	                          
+drop table if exists t_ch_opex_bb;
+create temp table t_ch_opex_bb(  		                          
+methods int not null,
+calmonth int not null,
+version_id int not null,
+pao_do varchar(10) not null,
+cst_1 varchar(255) null,
+fin_nefin varchar(255)null,
+bis_block varchar(255) null, 
+func_block varchar(255) null,
+run_change varchar(255) null,
+indication_incoming_payments varchar(255) null,
+cst_2 varchar(255) null,
+sum_cumulative_y float		                          
+);		
+
+--do $$
+--declare 
+var_vers_min := (select min(id) from cnt_vers);
+var_vers_max := (select max(id) from cnt_vers);
+--begin 
+
+while var_vers_min <= var_vers_max
+loop 
+insert into t_ch_opex_bb
+select opex_bb.methods,
+        opex_bb.calmonth,
+	    opex_bb.version_id,
+	    opex_bb.pao_do,
+	    opex_bb.cst_1,
+	    opex_bb.fin_nefin,
+	    opex_bb.bis_block, 
+        opex_bb.func_block,
+	    opex_bb.run_change,
+		opex_bb.indication_incoming_payments,
+		opex_bb.cst_2,
+	    sum(opex_bb.cumulative_y) as sum_cumulative_y
+from t_ch_opex_bb_prep as opex_bb
+where opex_bb.version_id = (select version_id from cnt_vers where id = var_vers_min)
+group by opex_bb.methods,
+         opex_bb.calmonth,
+	     opex_bb.version_id,
+	     opex_bb.pao_do,
+	     opex_bb.cst_1,
+	     opex_bb.fin_nefin,
+	     opex_bb.bis_block, 
+         opex_bb.func_block,
+	     opex_bb.run_change,
+		 opex_bb.indication_incoming_payments,
+		 opex_bb.cst_2;
+		
+var_vers_min = var_vers_min + var_one_for_while; 
+end loop;
+--end $$;		
+
+
+var_vers_id :=(select version_id from cnt_vers where version_name = var_bp);
+	 
+drop table if exists t_ch_opex;
+create temp table t_ch_opex as( 
+select opex_bb.methods,
+       opex_bb.calmonth,
+	   case when opex_bb.version_id = var_vers_id then var_value_plan else var_value_fact end as vers,
+	   opex_bb.pao_do,
+	   opex_bb.cst_1,
+	   opex_bb.fin_nefin,
+	   opex_bb.bis_block, 
+       opex_bb.func_block,
+	   opex_bb.run_change,
+	   var_type_calc as type_calc, --(ВГО- внутре групповые обороты)
+	   opex_bb.indication_incoming_payments,
+	   opex_bb.cst_2,
+	   opex_bb.sum_cumulative_y/var_mln as sum_cumulative_y
+from t_ch_opex_bb as opex_bb);	
+
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 4,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'Завершена подготовка данных t_ch_opex_bb',
+						   userid => 13,
+						   begin_rid => 0);	
+	
+drop table if exists renames_tuk;
+create temp table renames_tuk as (
+select t_h_dict.field,
+	   t_h_dict.curname,
+	   t_h_dict."rename" as rename,
+	   t_h_dict."comment" as comment,
+	   t_h_dict."method" as method 
+from s26_na_edr."t_h_dict_Renames" as t_h_dict
+where t_h_dict."sourceName" = var_source_name_tuk);
+
+drop table if exists t_ch_tuk_prep_agg;
+create temp table t_ch_tuk_prep_agg as(
+select tuk."Методология" as method,
+	   tuk."Период" as period,
+	   tuk."Версия" as vers,
+	   tuk."ПАО/ДО" as pao_do,
+	   tuk."Фин/Нефин" as fin_nefin,
+       tuk."Бизнес-блок" as bis_block,
+       tuk."Иерархия подразделений ур2" as hierarchy_division_lvl2,
+       tuk."Статья уровень 3" as cst_lvl_3,
+       tuk."Статья уровень 4" as cst_lvl_4,
+	   sum("Сумма") as summ
+from s26_na_edr.t_ch_tuk as tuk
+where tuk."ПАО/ДО" = var_do
+and tuk."Методология" = var_methods
+and tuk."Статья уровень 1" = var_cst_lvl_1
+group by tuk."Методология",
+	     tuk."Период",
+	     tuk."Версия",
+	     tuk."ПАО/ДО",
+	     tuk."Фин/Нефин",
+         tuk."Бизнес-блок",
+         tuk."Иерархия подразделений ур2",
+         tuk."Статья уровень 3",
+         tuk."Статья уровень 4");
+             
+drop table if exists t_ch_tuk_prep;
+create temp table t_ch_tuk_prep as( 
+select tuk.method,
+       tuk.period,
+       tuk.vers,
+       tuk.pao_do,
+       case when tuk_cst.rename is null then var_value_other else tuk_cst.rename end as cst_lvl3,
+       tuk_cst.curname as curname_1,
+       tuk.fin_nefin,
+	   case when tuk.bis_block in (var_nefin_bis, var_fin_bis) then tuk.bis_block
+			 when bb_tuk.rename is null or bb_tuk.rename ilike var_cfo or bb_tuk.rename ilike var_other or bb_tuk.rename = var_sberx then var_value_other_bb 
+			 else bb_tuk.rename end as bis_block,
+	   bb_tuk.curname as curname_2,
+	   tuk.summ,
+	   case when tuk.hierarchy_division_lvl2 in (var_in_system_calc, var_operation_group) then var_value_do_vgo else var_value_do_not_vgo end as type_calc,
+	   tuk.cst_lvl_4
+from t_ch_tuk_prep_agg as tuk 
+left join renames_tuk as tuk_cst on tuk_cst.curname = tuk.cst_lvl_3
+		                                  and tuk_cst.field = var_cst_field_lvl_3
+		                                  and tuk_cst.comment = var_comment
+		                                  and (tuk_cst.method = tuk.method or tuk_cst.method is null)
+left join renames_tuk as bb_tuk on bb_tuk.curname = tuk.bis_block
+		                                 and bb_tuk.field = var_field_bb
+		                                 and bb_tuk.comment = var_field_bb
+		                                 and (bb_tuk.method = var_old_method or bb_tuk.method is null));
+        
+--21570
+--Время выполнения: 
+drop table if exists t_ch_tuk; 
+create temp table t_ch_tuk as( 
+select tuk.method,
+       tuk.period,
+       tuk.vers,
+       tuk.pao_do,
+       tuk.cst_lvl3,
+       tuk.curname_1,--Зачем?
+       tuk.fin_nefin,
+	   tuk.bis_block,
+	   var_func_block as func_block,
+	   var_run_change as run_change,
+	   tuk.curname_2,--Зачем?
+	   tuk.type_calc,
+	   tuk.cst_lvl_4,
+	   sum(tuk.summ) as summ	   
+from t_ch_tuk_prep as tuk	   
+group by tuk.method,
+         tuk.period,
+         tuk.vers,
+         tuk.pao_do,
+         tuk.cst_lvl3,
+         tuk.curname_1,
+         tuk.fin_nefin,
+	     tuk.bis_block,
+	     tuk.curname_2,
+	     tuk.type_calc,
+	     tuk.cst_lvl_4);
+	    
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 5,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'Завершена подготовка данных t_ch_tuk',
+						   userid => 13,
+						   begin_rid => 0);	    
+
+--todo ref вынести в физическую таблицу 	    
+drop table if exists load_data_settings;
+create temp table load_data_settings(
+id int generated always as identity,
+AXIS_18 varchar(100),
+AXIS_19 varchar(100),
+AXIS_20 varchar(100),
+request_criterion_opex varchar(255),
+request_criterion_tuk varchar(255)
+);	 
+
+-- пока на текстах хардкодом также по требованию поддержки, в будущем будет в насройках такой же структуры с возможностью просмотра и редактирования в интерфейсе EPM
+insert into load_data_settings (AXIS_18,AXIS_19,AXIS_20,request_criterion_opex,request_criterion_tuk)
+values 
+('''Входящие платы''','''После капитализации''','''С ГП''','',''),
+('''Входящие платы''','''После капитализации''','''Без ГП''','where opex_bb.cst_2 not in (''Годовая премия'') or opex_bb.cst_2 is null','where tuk.cst_lvl_4 != ''Годовая премия'''),
+('''Входящие платы''','''До капитализации''','''С ГП''','where opex_bb.cst_2 not in (''Капитализация'') or opex_bb.cst_2 is null',''),
+('''Входящие платы''','''До капитализации''','''Без ГП''','where opex_bb.cst_2 not in (''Капитализация'', ''Годовая премия'') or opex_bb.cst_2 is null','where tuk.cst_lvl_4 != ''Годовая премия'''),
+('''Без входящих плат''','''После капитализации''','''С ГП''','where (opex_bb.indication_incoming_payments  !=  ''X'' or opex_bb.indication_incoming_payments is null)',''),
+('''Без входящих плат''','''После капитализации''','''Без ГП''','
+where (opex_bb.cst_2 not in (''Годовая премия'') or opex_bb.cst_2 is null)
+and (opex_bb.indication_incoming_payments  !=  ''X'' or opex_bb.indication_incoming_payments is null)','where tuk.cst_lvl_4 != ''Годовая премия'''),
+('''Без входящих плат''','''До капитализации''','''С ГП''','
+where (opex_bb.cst_2 not in (''Капитализация'') or opex_bb.cst_2 is null)
+and (opex_bb.indication_incoming_payments  !=  ''X'' or opex_bb.indication_incoming_payments is null)',''),
+('''Без входящих плат''','''До капитализации''','''Без ГП''','
+where (opex_bb.cst_2 not in (''Капитализация'') or opex_bb.cst_2 is null)
+and (opex_bb.indication_incoming_payments  !=  ''X'' or opex_bb.indication_incoming_payments is null)','where tuk.cst_lvl_4 != ''Годовая премия''');
+
+--#todo refact вынести в физическую таблицу   
+drop table if exists settings_axis_2;
+create temp table settings_axis_2 (
+id int,
+attribute_value varchar(100),
+attribute_settings text
+);
+insert into settings_axis_2 (id,attribute_value,attribute_settings)
+values (1,'Группа','''Группа'''),
+       (2,'ПАО/ДЗО','''ПАО'', ''ДО ВГО'', ''ДО не ВГО'', ''ДО'''),
+       (3,'Фин/Нефин','''Финансовый бизнес'', ''Нефинансовый бизнес'', ''Прочие и ВГО'''),
+       (4,'Категории','''Персонал'', ''IT'', ''Недвижимость'', ''Бизнес-расходы'', ''Маркетинг'', ''Прочие'''),
+       (5,'Бизнес-блоки','''ГП и капитализация внутр. разработки'', ''SberX'', ''SBI'', ''БСП'', ''КИБ'', ''Прочие Блоки'', ''РБ'', ''УБ'', ''Нефинансовый бизнес B2C'', ''Финансовый бизнес B2C'''),
+       (6,'Функциональные блоки','''% ФБ%'''),
+       (7,'RUN/CHANGE','''RUN'', ''CHANGE'', ''ДЗО RUN CHANGE'''),
+       (8,'ДЗО','''ДЗО RUN CHANGE'''),
+       (9,'Прочие','''Прочие Ф\Н''');
+      
+drop table if exists temp_t_load_edr;
+create temp table temp_t_load_edr( 
+	sheet varchar(255) NULL,
+	kpi_id numeric(10, 2) NULL,
+	date_ timestamp(3) NULL,
+	dynamictype int4 NULL,
+	axis_1 varchar(512) NULL,
+	axis_2 varchar(512) NULL,
+	axis_3 varchar(512) NULL,
+	axis_18 varchar(512) NULL,
+	axis_19 varchar(512) NULL,
+	axis_20 varchar(512) NULL,
+	nversionid int4 NULL,
+	fvalue numeric NULL,
+	scomment varchar(512) NULL,
+	ntotaltype int2 null,
+	cnt_cycle int );     
+
+
+var_id_min := (select min(id) from load_data_settings);
+var_id_max := (select max(id) from load_data_settings);
+var_group := (select attribute_settings from settings_axis_2 where id = 1);
+var_pao_do := (select attribute_settings from settings_axis_2 where id = 2);
+var_fin_nefin := (select attribute_settings from settings_axis_2 where id = 3);
+var_category := (select attribute_settings from settings_axis_2 where id = 4);
+var_bissblock := (select attribute_settings from settings_axis_2 where id = 5);
+var_funcblock := (select attribute_settings from settings_axis_2 where id = 6);
+var_run_change_set := (select attribute_settings from settings_axis_2 where id = 7);
+var_dzo := (select attribute_settings from settings_axis_2 where id = 8);
+var_others := (select attribute_settings from settings_axis_2 where id = 9);
+
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 6,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'Старт расчета данных для t_load_edr',
+						   userid => 13,
+						   begin_rid => 0);	
+	
+while var_id_min <= var_id_max
+loop
+var_cnt_cycle := var_id_min;	
+var_axis_18 := (select axis_18 from load_data_settings where id = var_id_min);
+var_axis_19 := (select axis_19 from load_data_settings where id = var_id_min);
+var_axis_20 := (select axis_20 from load_data_settings where id = var_id_min);
+var_criterion_opex := (select request_criterion_opex from load_data_settings where id = var_id_min);
+var_criterion_tuk := (select request_criterion_tuk from load_data_settings where id = var_id_min);	
+	
+sql_full_opex :='	
+drop table if exists temp_full_opex;   
+create temp table temp_full_opex as(
+select opex_bb.methods as "Методология",
+       opex_bb.calmonth as "Период",
+	   opex_bb.vers as "Версия",
+	   '''|| var_lvl_0 ||''' as lvl0,
+	   opex_bb.pao_do as lvl1,
+	   opex_bb.cst_1 as lvl2,
+	   opex_bb.fin_nefin as lvl3,
+	   opex_bb.bis_block as lvl4, 
+       opex_bb.func_block as lvl5,
+	   opex_bb.run_change as lvl6,
+	   opex_bb.type_calc as lvl7,
+	   sum(opex_bb.sum_cumulative_y) as "Сумма"
+from t_ch_opex as opex_bb '
+|| var_criterion_opex ||'
+group by opex_bb.methods,
+         opex_bb.calmonth,
+	     opex_bb.vers,
+	     opex_bb.pao_do,
+	     opex_bb.cst_1,
+	     opex_bb.fin_nefin,
+	     opex_bb.bis_block, 
+         opex_bb.func_block,
+	     opex_bb.run_change,
+	     opex_bb.type_calc
+union all 
+select tuk.method,
+       tuk.period::int,
+       tuk.vers,
+       '''|| var_lvl_0 ||''' as lvl_0,
+       tuk.pao_do,
+       tuk.cst_lvl3 as cst,
+       tuk.fin_nefin,
+       tuk.bis_block,
+       tuk.func_block,
+       tuk.run_change,
+       tuk.type_calc,
+       sum(tuk.summ) as summ
+from t_ch_tuk as tuk '
+|| var_criterion_tuk ||'
+group by tuk.method,
+         tuk.period::int,
+         tuk.vers,
+         tuk.pao_do,
+         tuk.cst_lvl3,
+         tuk.fin_nefin,
+         tuk.bis_block,
+         tuk.func_block,
+         tuk.run_change,
+         tuk.type_calc);'; 
+execute sql_full_opex;
+--raise notice '%',sql_full_opex; 
+
+
+drop table if exists temp_opex_by_layers;
+sql_get_opex_by_layers :=
+ navigator_edr.f_get_dinamic_query_levels(
+      "@level" => var_lvl_max,
+      "@from" => var_table_name_from,
+      "@into"  => var_table_name_into,
+      "@variant" => var_variant);     
+execute sql_get_opex_by_layers;
+--raise notice '%',sql_get_opex_by_layers;
+
+drop table if exists pao_kat;
+create temp table pao_kat as(
+select fo."Методология"::varchar(10) as methods ,
+       fo."Период"::varchar(10) as periods,
+	   fo."Версия" as vers,
+	   fo.lvl2 as axis_2,
+	   sum(fo."Сумма") as summ 
+from temp_full_opex as fo 
+where fo.lvl1 = var_pao
+group by fo."Методология",
+       fo."Период",
+	   fo."Версия",
+	   fo.lvl2);
+	  
+drop table if exists opex_by_layers;
+create temp table opex_by_layers as(
+select t_opex."Методология"::varchar(6) as methods ,
+       t_opex."Период"::varchar(6) as periods,
+	   t_opex."Версия" as vers,
+	   t_opex."AXIS_2" as axis_2,
+	   t_opex."Сумма" as summ
+from temp_opex_by_layers as t_opex);
+
+sql_text_opex_by_layers := 
+'drop table if exists t_load_edr;
+create temp table t_load_edr as(
+select concat(''М'',right(methods,2)) as sheet,
+	   '|| var_kpi ||' as KPI_ID,
+	   DATE_TRUNC(''month'',make_date(left(periods,4)::int,right(periods,2)::int,1)) + interval ''1 month - 1 day'' as DATE_,
+	   '|| var_dynamic_type ||' as DynamicType,
+	   CONCAT(''М'',right(methods,2)) as AXIS_1,
+	   case when AXIS_2 in ('|| var_group ||') then '''|| var_lvl_0 ||'''
+	          when AXIS_2 in ('|| var_pao_do || ') then '|| var_value_pao_dzo ||'
+	             when AXIS_2 in ('|| var_fin_nefin || ') then '|| var_value_fin_nefin ||'
+	                when AXIS_2 in ('|| var_category ||') then '|| var_value_category ||'
+	                   when AXIS_2 in ('|| var_bissblock ||') then '|| var_value_bb ||'
+	                      when AXIS_2 ilike '|| var_funcblock ||' then '|| var_value_fb ||'
+	                         when AXIS_2 in ('|| var_run_change_set ||') then '|| var_value_run_change ||' end as AXIS_2,
+	   case when AXIS_2 in ('|| var_dzo ||') then '|| var_value_dzo ||'
+	          when AXIS_2 in ('|| var_others ||') then '''|| var_value_other ||''' else AXIS_2 end as AXIS_3,	
+	   '|| var_axis_18 ||' as AXIS_18,
+	   '|| var_axis_19 ||' as AXIS_19,
+	   '|| var_axis_20 ||' as AXIS_20,
+	   case when vers = '''|| var_value_fact ||''' then 0
+		       when vers = '''|| var_value_plan ||''' then 1 else 5 end as nVersionID,
+	   summ as fValue,
+	   '|| var_s_comment ||' as sComment,
+	   '|| var_nTotalType ||' as nTotalType
+from opex_by_layers);';
+execute sql_text_opex_by_layers;
+
+sql_text_pao_kat :=
+'drop table if exists t_load_edr_from_pao_kat;   
+create temp table t_load_edr_from_pao_kat as (
+select concat(''М'', right(methods, 2)) as SHEET,
+       '|| var_kpi ||' as KPI_ID,
+       date_trunc(''month'', make_date(left(periods, 4)::int, right(periods, 2)::int, 1)) + INTERVAL ''1 month - 1 day'' as DATE_,
+       '|| var_dynamic_type ||' as DynamicType,
+       CONCAT(''М'', RIGHT(methods, 2)) as AXIS_1,
+       '''|| var_pao ||''' as AXIS_2,
+       axis_2 as AXIS_3,
+       '|| var_axis_18 ||' as AXIS_18,
+       '|| var_axis_19 ||' as AXIS_19,
+       '|| var_axis_20 ||' as AXIS_20,
+       case when vers = '''|| var_value_fact ||''' then 0
+               when vers = '''|| var_value_plan ||''' then 1 else 5 end as nVersionID,
+       summ as fValue,
+       '|| var_s_comment ||' as sComment,
+       '|| var_nTotalType ||' as nTotalType
+FROM pao_kat);';
+--raise notice '%',sql_text_pao_kat;
+execute sql_text_pao_kat;
+ 
+--перед циклом загрузки данных удаляем данные по kpi_id 
+insert into temp_t_load_edr (sheet,
+                             kpi_id,
+                             date_,
+                             dynamictype,
+                             axis_1,
+                             axis_2,
+                             axis_3,
+                             axis_18,
+                             axis_19,
+                             axis_20,
+                             nversionid,
+                             fvalue,
+                             scomment,
+                             ntotaltype,
+                             cnt_cycle)
+
+select sheet,
+       kpi_id,
+       date_,
+       dynamictype::int,
+       axis_1,
+       axis_2,
+       axis_3,
+       axis_18,
+       axis_19,
+       axis_20,
+       nversionid,
+       fvalue,
+       scomment,
+       ntotaltype::int2,
+       var_cnt_cycle --переменная для циклов
+from t_load_edr
+union all
+select sheet,
+       kpi_id,
+       date_,
+       dynamictype::int,
+       axis_1,
+       axis_2,
+       axis_3,
+       axis_18,
+       axis_19,
+       axis_20,
+       nversionid,
+       fvalue,
+       scomment,
+       ntotaltype::int2, 
+       var_cnt_cycle --переменная для циклов
+from t_load_edr_from_pao_kat;
+--select count(*) from temp_full_opex
+--select count(*) from opex_by_layers
+--select count(*) from pao_kat
+var_id_min = var_id_min + 1;
+end loop;
+
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 7,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'Завершен расчет данных для t_load_edr',
+						   userid => 13,
+						   begin_rid => 0);	
+
+truncate table navigator_edr.t_load_edr_test;
+insert into navigator_edr.t_load_edr_test (sheet,
+                                                   kpi_id,
+                                                   date_,
+                                                   dynamictype,
+                                                   axis_1,
+                                                   axis_2,
+                                                   axis_3,
+                                                   axis_18,
+                                                   axis_19,
+                                                   axis_20,
+                                                   nversionid,
+                                                   fvalue,
+                                                   scomment,
+                                                   ntotaltype)
+select sheet,
+       kpi_id,
+       date_,
+       dynamictype,
+       axis_1,
+       axis_2,
+       axis_3,
+       axis_18,
+       axis_19,
+       axis_20,
+       nversionid,
+       fvalue,
+       scomment,
+       ntotaltype
+from temp_t_load_edr;
+
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 7,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'Загружены данные в итоговую таблицу navigator_edr.t_load_edr_test',
+						   userid => 13,
+						   begin_rid => 0);	
+						  
+--Отправляем уведомление о выполнении расчета 
+						  
+call logs."recordlogging_proc" (proc_name => proc_name,
+						   params => null,
+						   step => 8,
+						   ds => start_proc,
+						   rows_affected => null,
+						   message => 'proc end',
+						   userid => 13,
+						   begin_rid => 0);							  
+END;$procedure$
+;
