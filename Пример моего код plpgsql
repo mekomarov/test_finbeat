@@ -258,6 +258,7 @@ where t_h_dict."sourceName" = var_source_name_opex);
 
 --Формирование данных t_ch_opex_bb
 --Время выполнения:02.36 min 
+
 var_sql_query_opex_prep :='	
 drop table if exists t_ch_opex_bb_prep;
 create temp table t_ch_opex_bb_prep as(
@@ -285,7 +286,8 @@ left join renames_opex as re_bb on re_bb.curname = opex_bb.bis_block_lvl1_txt
 		                           and (re_bb.method = '|| var_old_method ||' or re_bb.method is null));';	
 		                          
 --raise notice '%',var_sql_query_opex_prep;		                          
-execute var_sql_query_opex_prep;	                          
+execute var_sql_query_opex_prep;	
+
 drop table if exists t_ch_opex_bb;
 create temp table t_ch_opex_bb(  		                          
 methods int not null,
