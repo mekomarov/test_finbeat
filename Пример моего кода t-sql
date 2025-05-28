@@ -17,8 +17,6 @@ ALTER proc [dbo].[update_adjusting_forecast]
 as
 begin
 
-declare @Emails varchar (255) ='mekomarov@omega.sbrf.ru',
-		@copy_recipietns varchar(255)= 'IPKramer@omega.sbrf.ru;Sablina.I.E@omega.sbrf.ru;mekomarov@sberbank.ru;';
 
 Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
 values ( object_name(@@PROCID), getdate(), 'Procedure start', SUSER_NAME() );
@@ -2445,14 +2443,8 @@ FROM [dbo].[correction_forecast_all] as cf
 where exists (select*from #quartrly_month as qm where qm.quartrly_month = cf.adjustment_period_month)
 
 
---Отправка файла на ФИР в ПИМОП
-insert into AMIS_OPEX_AMIS25S.AVRORA_PRD.dbo.showCaseStatus([name],[dateReport],[created])
-values('correction_forecast_pimop',null,getdate());
 
---Отправляем сообщение, данные обновили  
-insert into SERVDB.[mail].[MsgLst]([Recipients], [Subjects], [Body],Copy_Recipients) 
-values (@Emails,'Корректировки по прогнозу', 'Добрый день!' + char(13) + 'Расчёт ручных корректировок для ОВБП и передача в ЦК ПИМОП выполнен!' + char(13) + 'Хорошего Вам дня!',
-@copy_recipietns);
+
 
 Insert into [AMIS_OPEX_AMIS25S].dbstore.[logs].[Логи процедур] (ObjectName, EventMoment, EventText, UserLogin)
 values ( object_name(@@PROCID), getdate(), 'proc end', SUSER_NAME() );
